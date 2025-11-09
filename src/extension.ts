@@ -1948,13 +1948,25 @@ async function runCucumberTestWithMavenResult(
     passed: 0
   };
 
+  // Line buffer to handle incomplete lines from stdout chunks
+  let lineBuffer = '';
+
   return await new Promise<number>((resolve) => {
     child.stdout?.on('data', (chunk: Buffer) => {
       const output = chunk.toString();
 
       // Parse output for step results
       if (parser) {
-        const lines = output.split('\n');
+        // Append chunk to line buffer
+        lineBuffer += output;
+
+        // Split by newlines and keep the last incomplete part in buffer
+        const lines = lineBuffer.split('\n');
+
+        // Keep the last element (incomplete line) in the buffer
+        lineBuffer = lines.pop() || '';
+
+        // Process only complete lines
         for (const line of lines) {
           parser.parseLine(line);
 
@@ -2004,6 +2016,13 @@ async function runCucumberTestWithMavenResult(
     child.on('close', (code) => {
       const exitCode = typeof code === 'number' ? code : 1;
       logToExtension(`Maven process exited with code: ${exitCode}`, 'INFO');
+
+      // Parse any remaining content in the line buffer
+      if (parser && lineBuffer.trim()) {
+        logToExtension(`Processing remaining buffered line: "${lineBuffer}"`, 'DEBUG');
+        parser.parseLine(lineBuffer);
+        lineBuffer = '';
+      }
 
       // Finalize parser to display any pending steps
       if (parser) {
