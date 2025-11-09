@@ -116,6 +116,17 @@
           "type": "boolean",
           "default": false,
           "description": "Enable CodeLens buttons in feature files. When disabled, use Test Explorer instead for a cleaner interface."
+        },
+        "cucumberJavaEasyRunner.executionMode": {
+          "type": "string",
+          "enum": ["java", "maven"],
+          "default": "java",
+          "description": "Execution mode: 'java' for direct Java execution, 'maven' for Maven test execution (supports multi-module projects)"
+        },
+        "cucumberJavaEasyRunner.testClassName": {
+          "type": "string",
+          "default": "",
+          "description": "Test class name for Maven execution mode (e.g., MktSegmentCriteriaUpdateTest). Leave empty for auto-detection."
         }
       }
     }

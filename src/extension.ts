@@ -24,6 +24,12 @@ interface FeatureInfo {
   lineNumber: number;
 }
 
+interface ModuleInfo {
+  modulePath: string;
+  moduleRelativePath: string;
+  workspaceRoot: string;
+}
+
 /**
  * Test controller for Cucumber tests
  */
@@ -620,7 +626,7 @@ export function activate(context: vscode.ExtensionContext) {
  */
 async function runSelectedTest(uri: vscode.Uri, lineNumber?: number, exampleLine?: number) {
   const terminal = vscode.window.createTerminal('Cucumber Feature');
-  
+
   // Find the project root directory
   const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
   if (!workspaceFolder) {
@@ -628,50 +634,106 @@ async function runSelectedTest(uri: vscode.Uri, lineNumber?: number, exampleLine
     return false;
   }
 
-  // Get the relative path of the feature file in the project
-  const relativePath = path.relative(workspaceFolder.uri.fsPath, uri.fsPath);
-  
+  const workspaceRoot = workspaceFolder.uri.fsPath;
+
+  // Get configuration
+  const config = vscode.workspace.getConfiguration('cucumberJavaEasyRunner');
+  const executionMode = config.get<string>('executionMode', 'java');
+  const configuredTestClass = config.get<string>('testClassName', '');
+
+  // Find the Maven module for this feature file
+  const moduleInfo = findMavenModule(uri.fsPath, workspaceRoot);
+
+  // Get the relative path of the feature file in the workspace
+  const relativePath = path.relative(workspaceRoot, uri.fsPath);
+
   // Save the run mode information
   let runMode = 'feature';
   if (lineNumber && lineNumber > 0) {
     runMode = exampleLine ? 'example' : 'scenario';
   }
-  
+
   console.log(`Run mode: ${runMode}`);
+  console.log(`Execution mode: ${executionMode}`);
+  console.log(`Module path: ${moduleInfo.modulePath}`);
+  console.log(`Module relative path: ${moduleInfo.moduleRelativePath}`);
   console.log(`Feature: ${relativePath}`);
   console.log(`Scenario line: ${lineNumber || 'entire feature'}`);
   console.log(`Example line: ${exampleLine || 'all scenarios'}`);
-  
+
   try {
-    // Scan the project to find the steps directory
-    const gluePath = await findGluePath(workspaceFolder.uri.fsPath);
-    
-    if (!gluePath) {
-      // If glue path is not found, ask the user
-      const userInput = await vscode.window.showInputBox({
-        prompt: 'Enter glue path for steps directory (e.g. org.example.steps)',
-        placeHolder: 'org.example.steps'
-      });
-      
-      if (!userInput) {
-        vscode.window.showErrorMessage('Glue path not specified, operation cancelled.');
-        return false;
+    if (executionMode === 'maven') {
+      // Maven execution mode
+      let testClassName: string = configuredTestClass;
+
+      // Auto-detect test class if not configured
+      if (!testClassName) {
+        const autoDetectedClass = await findCucumberTestClass(moduleInfo.modulePath);
+
+        if (!autoDetectedClass) {
+          const userInput = await vscode.window.showInputBox({
+            prompt: 'Enter test class name (e.g., MktSegmentCriteriaUpdateTest)',
+            placeHolder: 'MktSegmentCriteriaUpdateTest'
+          });
+
+          if (!userInput) {
+            vscode.window.showErrorMessage('Test class name not specified, operation cancelled.');
+            return false;
+          }
+          testClassName = userInput;
+        } else {
+          testClassName = autoDetectedClass;
+        }
       }
-      
-      runCucumberTest(workspaceFolder.uri.fsPath, relativePath, userInput, terminal, lineNumber, exampleLine);
-    } else {
-      // If glue path is found, run directly
+
       let message = '';
       if (runMode === 'feature') {
-        message = `Running feature file with glue path "${gluePath}"`;
+        message = `Running feature file with Maven test (${testClassName})`;
       } else if (runMode === 'scenario') {
-        message = `Running scenario at line ${lineNumber} with glue path "${gluePath}"`;
+        message = `Running scenario at line ${lineNumber} with Maven test (${testClassName})`;
       } else if (runMode === 'example') {
-        message = `Running example at line ${lineNumber}:${exampleLine} with glue path "${gluePath}"`;
+        message = `Running example at line ${lineNumber}:${exampleLine} with Maven test (${testClassName})`;
       }
-      
+
       vscode.window.showInformationMessage(message);
-      runCucumberTest(workspaceFolder.uri.fsPath, relativePath, gluePath, terminal, lineNumber, exampleLine);
+      await runCucumberTestWithMaven(
+        workspaceRoot,
+        moduleInfo,
+        relativePath,
+        testClassName,
+        terminal,
+        lineNumber,
+        exampleLine
+      );
+    } else {
+      // Java execution mode (original behavior)
+      const gluePath = await findGluePath(moduleInfo.modulePath);
+
+      if (!gluePath) {
+        const userInput = await vscode.window.showInputBox({
+          prompt: 'Enter glue path for steps directory (e.g. org.example.steps)',
+          placeHolder: 'org.example.steps'
+        });
+
+        if (!userInput) {
+          vscode.window.showErrorMessage('Glue path not specified, operation cancelled.');
+          return false;
+        }
+
+        runCucumberTest(moduleInfo.modulePath, relativePath, userInput, terminal, lineNumber, exampleLine);
+      } else {
+        let message = '';
+        if (runMode === 'feature') {
+          message = `Running feature file with glue path "${gluePath}"`;
+        } else if (runMode === 'scenario') {
+          message = `Running scenario at line ${lineNumber} with glue path "${gluePath}"`;
+        } else if (runMode === 'example') {
+          message = `Running example at line ${lineNumber}:${exampleLine} with glue path "${gluePath}"`;
+        }
+
+        vscode.window.showInformationMessage(message);
+        runCucumberTest(moduleInfo.modulePath, relativePath, gluePath, terminal, lineNumber, exampleLine);
+      }
     }
   } catch (error: any) {
     vscode.window.showErrorMessage(`Error: ${error.message || 'Unknown error'}`);
@@ -693,23 +755,69 @@ async function runSelectedTestAndWait(
     return 1;
   }
 
-  const projectRoot = workspaceFolder.uri.fsPath;
-  const relativePath = path.relative(projectRoot, uri.fsPath);
+  const workspaceRoot = workspaceFolder.uri.fsPath;
+
+  // Get configuration
+  const config = vscode.workspace.getConfiguration('cucumberJavaEasyRunner');
+  const executionMode = config.get<string>('executionMode', 'java');
+  const configuredTestClass = config.get<string>('testClassName', '');
+
+  // Find the Maven module for this feature file
+  const moduleInfo = findMavenModule(uri.fsPath, workspaceRoot);
+
+  const relativePath = path.relative(workspaceRoot, uri.fsPath);
 
   try {
-    const gluePath = await findGluePath(projectRoot);
-    if (!gluePath) {
-      const userInput = await vscode.window.showInputBox({
-        prompt: 'Enter glue path for steps directory (e.g. org.example.steps)',
-        placeHolder: 'org.example.steps'
-      });
-      if (!userInput) {
-        vscode.window.showErrorMessage('Glue path not specified, operation cancelled.');
-        return 1;
+    if (executionMode === 'maven') {
+      // Maven execution mode
+      let testClassName: string = configuredTestClass;
+
+      // Auto-detect test class if not configured
+      if (!testClassName) {
+        const autoDetectedClass = await findCucumberTestClass(moduleInfo.modulePath);
+
+        if (!autoDetectedClass) {
+          const userInput = await vscode.window.showInputBox({
+            prompt: 'Enter test class name (e.g., MktSegmentCriteriaUpdateTest)',
+            placeHolder: 'MktSegmentCriteriaUpdateTest'
+          });
+
+          if (!userInput) {
+            vscode.window.showErrorMessage('Test class name not specified, operation cancelled.');
+            return 1;
+          }
+          testClassName = userInput;
+        } else {
+          testClassName = autoDetectedClass;
+        }
       }
-      return await runCucumberTestWithResult(projectRoot, relativePath, userInput, lineNumber, exampleLine, onOutput);
+
+      return await runCucumberTestWithMavenResult(
+        workspaceRoot,
+        moduleInfo,
+        relativePath,
+        testClassName,
+        lineNumber,
+        exampleLine,
+        onOutput
+      );
     } else {
-      return await runCucumberTestWithResult(projectRoot, relativePath, gluePath, lineNumber, exampleLine, onOutput);
+      // Java execution mode (original behavior)
+      const gluePath = await findGluePath(moduleInfo.modulePath);
+
+      if (!gluePath) {
+        const userInput = await vscode.window.showInputBox({
+          prompt: 'Enter glue path for steps directory (e.g. org.example.steps)',
+          placeHolder: 'org.example.steps'
+        });
+        if (!userInput) {
+          vscode.window.showErrorMessage('Glue path not specified, operation cancelled.');
+          return 1;
+        }
+        return await runCucumberTestWithResult(moduleInfo.modulePath, relativePath, userInput, lineNumber, exampleLine, onOutput);
+      } else {
+        return await runCucumberTestWithResult(moduleInfo.modulePath, relativePath, gluePath, lineNumber, exampleLine, onOutput);
+      }
     }
   } catch (error: any) {
     vscode.window.showErrorMessage(`Error: ${error.message || 'Unknown error'}`);
@@ -828,28 +936,110 @@ function findExampleAtLine(document: vscode.TextDocument, line: number): Scenari
 }
 
 /**
+ * Finds the nearest Maven module by searching upwards for pom.xml from the feature file
+ */
+function findMavenModule(featureFilePath: string, workspaceRoot: string): ModuleInfo {
+  let currentDir = path.dirname(featureFilePath);
+
+  // Search upwards for pom.xml
+  while (currentDir.startsWith(workspaceRoot)) {
+    const pomPath = path.join(currentDir, 'pom.xml');
+
+    if (fs.existsSync(pomPath)) {
+      // Found a pom.xml, this is our module
+      const moduleRelativePath = path.relative(workspaceRoot, currentDir);
+
+      return {
+        modulePath: currentDir,
+        moduleRelativePath: moduleRelativePath || '.',
+        workspaceRoot: workspaceRoot
+      };
+    }
+
+    // Move up one directory
+    const parentDir = path.dirname(currentDir);
+    if (parentDir === currentDir) {
+      // Reached the root
+      break;
+    }
+    currentDir = parentDir;
+  }
+
+  // No pom.xml found, use workspace root as module
+  return {
+    modulePath: workspaceRoot,
+    moduleRelativePath: '.',
+    workspaceRoot: workspaceRoot
+  };
+}
+
+/**
  * Finds the steps directories in the project and converts to Java package structure
  */
 async function findGluePath(projectRoot: string): Promise<string | null> {
   // In Maven projects, test code is usually in src/test/java
   const testDir = path.join(projectRoot, 'src', 'test', 'java');
-  
+
   if (!fs.existsSync(testDir)) {
     return null;
   }
-  
+
   // Recursively search for steps directories
   const stepsDir = await findStepsDir(testDir);
-  
+
   if (!stepsDir) {
     return null;
   }
-  
+
   // Create the Java package name for the steps directory
   // src/test/java/org/example/steps -> org.example.steps
   const packagePath = path.relative(testDir, stepsDir).replace(/\\/g, '/').replace(/\//g, '.');
-  
+
   return packagePath;
+}
+
+/**
+ * Finds Cucumber test class names in the module
+ */
+async function findCucumberTestClass(modulePath: string): Promise<string | null> {
+  const testDir = path.join(modulePath, 'src', 'test', 'java');
+
+  if (!fs.existsSync(testDir)) {
+    return null;
+  }
+
+  // Search for test classes with Cucumber annotations
+  const testClass = await findTestClassWithCucumberAnnotations(testDir);
+
+  return testClass;
+}
+
+/**
+ * Recursively searches for Java test classes with Cucumber annotations
+ */
+async function findTestClassWithCucumberAnnotations(dir: string): Promise<string | null> {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      const result = await findTestClassWithCucumberAnnotations(path.join(dir, entry.name));
+      if (result) {
+        return result;
+      }
+    } else if (entry.name.endsWith('Test.java') || entry.name.endsWith('Runner.java')) {
+      const filePath = path.join(dir, entry.name);
+      const content = fs.readFileSync(filePath, 'utf8');
+
+      // Check if this file contains Cucumber annotations
+      if (content.includes('@RunWith') || content.includes('@CucumberOptions') ||
+          content.includes('io.cucumber')) {
+        // Extract class name (without .java extension)
+        return entry.name.replace('.java', '');
+      }
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -1062,6 +1252,132 @@ public class CucumberRunner {
   // 3) Run tests and stream output
   const runCp = [fullClasspath, tmpDir].join(delimiter);
   const child = spawn('java', ['-cp', runCp, 'CucumberRunner'], { cwd: projectRoot });
+  return await new Promise<number>((resolve) => {
+    child.stdout?.on('data', (chunk: Buffer) => {
+      if (onOutput) onOutput(chunk.toString());
+    });
+    child.stderr?.on('data', (chunk: Buffer) => {
+      if (onOutput) onOutput(chunk.toString());
+    });
+    child.on('close', (code) => {
+      resolve(typeof code === 'number' ? code : 1);
+    });
+  });
+}
+
+/**
+ * Converts a feature file path to classpath format for Maven
+ * Example: src/test/resources/feature/login.feature -> classpath:feature/login.feature
+ */
+function convertToClasspathFormat(featureRelativePath: string, moduleRelativePath: string): string {
+  // Remove module path prefix if present
+  let pathInModule = featureRelativePath;
+  if (moduleRelativePath !== '.' && featureRelativePath.startsWith(moduleRelativePath)) {
+    pathInModule = featureRelativePath.substring(moduleRelativePath.length + 1);
+  }
+
+  // Try to find the path within src/test/resources or src/main/resources
+  const resourcesPrefixes = [
+    'src/test/resources/',
+    'src/main/resources/',
+    'src/test/java/',
+    'src/main/java/'
+  ];
+
+  for (const prefix of resourcesPrefixes) {
+    if (pathInModule.startsWith(prefix)) {
+      return 'classpath:' + pathInModule.substring(prefix.length);
+    }
+  }
+
+  // If not in resources, just use the path as is with classpath prefix
+  return 'classpath:' + pathInModule;
+}
+
+/**
+ * Runs the Cucumber test using Maven test command (supports multi-module projects)
+ */
+async function runCucumberTestWithMaven(
+  workspaceRoot: string,
+  moduleInfo: ModuleInfo,
+  featurePath: string,
+  testClassName: string,
+  terminal: vscode.Terminal,
+  lineNumber?: number,
+  exampleLineNumber?: number
+) {
+  // Convert feature path to classpath format
+  const classpathFeature = convertToClasspathFormat(featurePath, moduleInfo.moduleRelativePath);
+
+  // Build the cucumber.features parameter
+  let cucumberFeatures = classpathFeature;
+  if (lineNumber && lineNumber > 0) {
+    if (exampleLineNumber && exampleLineNumber > 0) {
+      cucumberFeatures += ':' + exampleLineNumber;
+    } else {
+      cucumberFeatures += ':' + lineNumber;
+    }
+  }
+
+  // Build the Maven command
+  let mvnCommand = `cd "${workspaceRoot}" && mvn test -Dcucumber.features="${cucumberFeatures}"`;
+
+  // Add -pl parameter for multi-module projects
+  if (moduleInfo.moduleRelativePath !== '.') {
+    mvnCommand += ` -pl ${moduleInfo.moduleRelativePath.replace(/\\/g, '/')}`;
+  }
+
+  // Add -Dtest parameter for test class
+  mvnCommand += ` -Dtest=${testClassName}`;
+
+  console.log(`Maven test command: ${mvnCommand}`);
+
+  terminal.sendText(mvnCommand);
+  terminal.show();
+}
+
+/**
+ * Runs the Cucumber test using Maven test command and returns the exit code
+ */
+async function runCucumberTestWithMavenResult(
+  workspaceRoot: string,
+  moduleInfo: ModuleInfo,
+  featurePath: string,
+  testClassName: string,
+  lineNumber?: number,
+  exampleLineNumber?: number,
+  onOutput?: (chunk: string) => void
+): Promise<number> {
+  // Convert feature path to classpath format
+  const classpathFeature = convertToClasspathFormat(featurePath, moduleInfo.moduleRelativePath);
+
+  // Build the cucumber.features parameter
+  let cucumberFeatures = classpathFeature;
+  if (lineNumber && lineNumber > 0) {
+    if (exampleLineNumber && exampleLineNumber > 0) {
+      cucumberFeatures += ':' + exampleLineNumber;
+    } else {
+      cucumberFeatures += ':' + lineNumber;
+    }
+  }
+
+  // Build Maven arguments
+  const mvnArgs = [
+    'test',
+    `-Dcucumber.features=${cucumberFeatures}`,
+    `-Dtest=${testClassName}`
+  ];
+
+  // Add -pl parameter for multi-module projects
+  if (moduleInfo.moduleRelativePath !== '.') {
+    mvnArgs.push('-pl', moduleInfo.moduleRelativePath.replace(/\\/g, '/'));
+  }
+
+  console.log(`Maven test args: ${mvnArgs.join(' ')}`);
+
+  // Execute Maven test
+  const child = spawn('mvn', mvnArgs, { cwd: workspaceRoot });
+
   return await new Promise<number>((resolve) => {
     child.stdout?.on('data', (chunk: Buffer) => {
       if (onOutput) onOutput(chunk.toString());
