@@ -547,9 +547,8 @@ class CucumberTestController {
             // Extract step text from label (format: "Given step text")
             const stepText = child.label;
             stepItemsMap.set(stepText, child);
-            // Mark all steps as started
-            run.started(child);
-            logToExtension(`Step queued: ${stepText}`, 'DEBUG');
+            // Don't mark steps as started here - they'll be marked when actually executed
+            logToExtension(`Step registered: ${stepText}`, 'DEBUG');
           }
         });
       }
@@ -643,11 +642,12 @@ class CucumberTestController {
           (data) => run.appendOutput(data, undefined, testItem),
           onStepUpdate
         );
-        if (exitCode === 0) {
+        // Mark example as passed if no steps failed, regardless of exit code
+        if (!hasFailedStep) {
           run.passed(testItem);
-        } else {
-          run.failed(testItem, new vscode.TestMessage(`Test failed with exit code ${exitCode}`));
+          logToExtension(`Example PASSED (no failed steps, exit code ${exitCode})`, 'INFO');
         }
+        // If hasFailedStep is true, we already marked it as failed in onStepUpdate
       } else if (testItem.id.includes(':scenario:')) {
         // This is a scenario
         const parts = testItem.id.split(':scenario:');
@@ -661,14 +661,11 @@ class CucumberTestController {
           onStepUpdate
         );
 
-        // Only mark as passed if no steps failed AND exit code is 0
-        if (!hasFailedStep && exitCode === 0) {
+        // Mark scenario as passed if no steps failed, regardless of exit code
+        // (exit code may be non-zero due to other tests failing in multi-module projects)
+        if (!hasFailedStep) {
           run.passed(testItem);
-          logToExtension(`Scenario PASSED (no failed steps, exit code 0)`, 'INFO');
-        } else if (!hasFailedStep) {
-          // Exit code non-zero but no failed steps detected
-          run.failed(testItem, new vscode.TestMessage(`Test failed with exit code ${exitCode}`));
-          logToExtension(`Scenario FAILED (exit code ${exitCode})`, 'ERROR');
+          logToExtension(`Scenario PASSED (no failed steps, exit code ${exitCode})`, 'INFO');
         }
         // If hasFailedStep is true, we already marked it as failed in onStepUpdate
       } else {
@@ -682,14 +679,13 @@ class CucumberTestController {
           onStepUpdate
         );
 
-        // Only mark as passed if no steps failed AND exit code is 0
-        if (!hasFailedStep && exitCode === 0) {
+        // Mark feature as passed if no steps failed, regardless of exit code
+        // (exit code may be non-zero due to other tests failing in multi-module projects)
+        if (!hasFailedStep) {
           run.passed(testItem);
-          logToExtension(`Feature PASSED (no failed steps, exit code 0)`, 'INFO');
-        } else if (!hasFailedStep) {
-          run.failed(testItem, new vscode.TestMessage(`Test failed with exit code ${exitCode}`));
-          logToExtension(`Feature FAILED (exit code ${exitCode})`, 'ERROR');
+          logToExtension(`Feature PASSED (no failed steps, exit code ${exitCode})`, 'INFO');
         }
+        // If hasFailedStep is true, we already marked it as failed in onStepUpdate
       }
 
     } catch (error) {
