@@ -73,9 +73,12 @@ class CucumberOutputParser {
   parseLine(line: string): StepResult | null {
     logToExtension(`Parsing line: "${line}"`, 'DEBUG');
 
-    // Pattern for Cucumber step execution (standard format)
-    // Example: "    Given I am on the login page                 # StepDefinitions.loginPage()"
-    const stepMatch = line.match(/^\s+(Given|When|Then|And|But)\s+(.+?)\s*(?:#|$)/);
+    // Pattern for Cucumber step execution with success/failure symbols
+    // Examples:
+    // "    ✔ And [MKT05A06] 存下取得的JWT身份驗證代碼    # tw.datahunter..."
+    // "    ✘ When [MKT05A06] 創建動態分眾...    # tw.datahunter..."
+    // "    Given I am on the login page    # StepDefinitions.loginPage()"
+    const stepMatch = line.match(/^\s*[✔✘✓✗×]?\s*(Given|When|Then|And|But)\s+(.+?)\s*(?:#|$)/);
 
     if (stepMatch) {
       // If we were capturing an error for a previous step, finish it
@@ -89,14 +92,25 @@ class CucumberOutputParser {
       const keyword = stepMatch[1];
       const stepText = stepMatch[2].trim();
 
-      // Create new step (we'll determine status later)
+      // Detect if the step already shows as failed (✘ symbol)
+      const isFailed = line.includes('✘') || line.includes('✗') || line.includes('×');
+
+      // Create new step
       this.currentStep = {
         keyword: keyword,
         name: stepText,
-        status: 'passed' // Default to passed, will change if we see an error
+        status: isFailed ? 'failed' : 'passed'
       };
 
-      logToExtension(`Found step: ${keyword} ${stepText}`, 'DEBUG');
+      logToExtension(`Found step: ${keyword} ${stepText}, status: ${this.currentStep.status}`, 'INFO');
+
+      // If step is already marked as failed, we'll wait for error details
+      // If step is passed, we can notify immediately (unless error follows)
+      if (!isFailed) {
+        // For passed steps, notify after a brief delay to see if error follows
+        // We'll finalize in the next line if no error appears
+      }
+
       return this.currentStep;
     }
 
@@ -120,10 +134,15 @@ class CucumberOutputParser {
       return null;
     }
 
-    // If we're not in an error and we have a current step, it passed
+    // If we have a current step and see a new step or certain markers, finalize the previous one
     if (this.currentStep && !this.isCapturingError) {
-      // Check if this is a blank line or new scenario/feature - finalize the step
-      if (line.trim() === '' || line.match(/^\s+(Scenario|Feature|Background)/)) {
+      // Check if this is a blank line, new scenario/feature, or another step symbol
+      const shouldFinalize = line.trim() === '' ||
+                            line.match(/^\s+(Scenario|Feature|Background)/) ||
+                            line.match(/^\s*[✔✘✓✗×]\s+(Given|When|Then|And|But)/);
+
+      if (shouldFinalize) {
+        // This step is done, notify about its status
         this.displayStepResult(this.currentStep);
         const result = this.currentStep;
         this.currentStep = null;
@@ -501,6 +520,7 @@ class CucumberTestController {
 
       // Create a map to track step test items by their text for real-time updates
       const stepItemsMap = new Map<string, vscode.TestItem>();
+      let hasFailedStep = false; // Track if any step has failed
 
       // If running a scenario, collect all step children
       if (testItem.id.includes(':scenario:') && !testItem.id.includes(':step:')) {
@@ -521,23 +541,36 @@ class CucumberTestController {
         const stepKey = `${stepResult.keyword} ${stepResult.name}`;
         const stepItem = stepItemsMap.get(stepKey);
 
+        logToExtension(`onStepUpdate called: ${stepKey} - ${stepResult.status}`, 'INFO');
+
         if (stepItem) {
           logToExtension(`Updating step in Test Explorer: ${stepKey} - ${stepResult.status}`, 'INFO');
 
           switch (stepResult.status) {
             case 'passed':
               run.passed(stepItem);
+              logToExtension(`✅ Step PASSED in UI: ${stepKey}`, 'INFO');
               break;
             case 'failed':
+              hasFailedStep = true; // Mark that we have a failed step
               const errorMsg = stepResult.errorMessage || 'Step failed';
               run.failed(stepItem, new vscode.TestMessage(errorMsg));
+              logToExtension(`❌ Step FAILED in UI: ${stepKey}`, 'ERROR');
+
+              // Immediately mark the scenario as failed if it's a scenario test
+              if (testItem.id.includes(':scenario:')) {
+                logToExtension(`Marking scenario as FAILED due to step failure: ${stepKey}`, 'ERROR');
+                run.failed(testItem, new vscode.TestMessage(`Step failed: ${stepKey}\n${errorMsg}`));
+              }
               break;
             case 'skipped':
               run.skipped(stepItem);
+              logToExtension(`⊝ Step SKIPPED in UI: ${stepKey}`, 'WARN');
               break;
           }
         } else {
-          logToExtension(`Step not found in Test Explorer: ${stepKey}`, 'WARN');
+          logToExtension(`⚠️ Step not found in Test Explorer: ${stepKey}`, 'WARN');
+          logToExtension(`Available steps: ${Array.from(stepItemsMap.keys()).join(', ')}`, 'DEBUG');
         }
       };
 
@@ -576,11 +609,17 @@ class CucumberTestController {
           (data) => run.appendOutput(data, undefined, testItem),
           onStepUpdate
         );
-        if (exitCode === 0) {
+
+        // Only mark as passed if no steps failed AND exit code is 0
+        if (!hasFailedStep && exitCode === 0) {
           run.passed(testItem);
-        } else {
+          logToExtension(`Scenario PASSED (no failed steps, exit code 0)`, 'INFO');
+        } else if (!hasFailedStep) {
+          // Exit code non-zero but no failed steps detected
           run.failed(testItem, new vscode.TestMessage(`Test failed with exit code ${exitCode}`));
+          logToExtension(`Scenario FAILED (exit code ${exitCode})`, 'ERROR');
         }
+        // If hasFailedStep is true, we already marked it as failed in onStepUpdate
       } else {
         // This is a feature file
         logToExtension(`Running entire feature file`, 'INFO');
@@ -591,10 +630,14 @@ class CucumberTestController {
           (data) => run.appendOutput(data, undefined, testItem),
           onStepUpdate
         );
-        if (exitCode === 0) {
+
+        // Only mark as passed if no steps failed AND exit code is 0
+        if (!hasFailedStep && exitCode === 0) {
           run.passed(testItem);
-        } else {
+          logToExtension(`Feature PASSED (no failed steps, exit code 0)`, 'INFO');
+        } else if (!hasFailedStep) {
           run.failed(testItem, new vscode.TestMessage(`Test failed with exit code ${exitCode}`));
+          logToExtension(`Feature FAILED (exit code ${exitCode})`, 'ERROR');
         }
       }
 
