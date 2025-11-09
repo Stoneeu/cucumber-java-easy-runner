@@ -1943,6 +1943,43 @@ async function runCucumberTestWithMavenResult(
     logToExtension(`Environment variables: ${JSON.stringify(envVars)}`, 'DEBUG');
   }
 
+  /**
+   * Filter function to identify Cucumber-related lines
+   * Only these lines will be passed to the parser for step detection
+   * This dramatically reduces noise from Maven/Spring/JPA logs
+   */
+  const isCucumberRelatedLine = (line: string): boolean => {
+    // Strip ANSI codes for accurate detection
+    const cleanLine = line.replace(/\x1b\[[0-9;]*m/g, '');
+
+    // Check for Cucumber step symbols: ✔✘✓✗×↷⊝−
+    if (/[✔✘✓✗×↷⊝−]/.test(cleanLine)) {
+      return true;
+    }
+
+    // Check for Cucumber step keywords at line start (with optional whitespace)
+    if (/^\s*(Given|When|Then|And|But)\s+/.test(cleanLine)) {
+      return true;
+    }
+
+    // Check for Cucumber scenario/feature markers
+    if (/^\s*(Scenario|Feature|Background|Examples):/.test(cleanLine)) {
+      return true;
+    }
+
+    // Check for error/exception lines (for failed step details)
+    if (/^\s+(at\s+|Caused by:|java\.|org\.junit|org\.opentest4j|AssertionError|Exception|Error:)/.test(cleanLine)) {
+      return true;
+    }
+
+    // Check for Cucumber summary lines
+    if (/\d+\s+(Scenarios?|Steps?)\s+\(/.test(cleanLine)) {
+      return true;
+    }
+
+    return false;
+  };
+
   // Execute Maven test
   const child = spawn('mvn', mvnArgs, { cwd: workspaceRoot, env: spawnEnv });
   logToExtension(`Maven process started in: ${workspaceRoot}`, 'INFO');
@@ -1957,6 +1994,10 @@ async function runCucumberTestWithMavenResult(
 
   // Line buffer to handle incomplete lines from stdout chunks
   let lineBuffer = '';
+
+  // Statistics for filtering
+  let totalLines = 0;
+  let filteredLines = 0;
 
   return await new Promise<number>((resolve) => {
     child.stdout?.on('data', (chunk: Buffer) => {
@@ -1975,7 +2016,16 @@ async function runCucumberTestWithMavenResult(
 
         // Process only complete lines
         for (const line of lines) {
-          parser.parseLine(line);
+          totalLines++;
+
+          // Filter: Only pass Cucumber-related lines to parser for step detection
+          // This avoids parser processing tons of Maven/Spring/JPA logs
+          const shouldParseForSteps = isCucumberRelatedLine(line);
+
+          if (shouldParseForSteps) {
+            filteredLines++;
+            parser.parseLine(line);
+          }
 
           // Parse test summary - Pattern: "5 Scenarios (2 failed, 3 passed)"
           const scenarioMatch = line.match(/(\d+)\s+Scenarios?\s+\(([^)]+)\)/i);
@@ -2035,6 +2085,10 @@ async function runCucumberTestWithMavenResult(
       if (parser) {
         parser.finalize();
         logToExtension('Parser finalized', 'DEBUG');
+
+        // Log filtering statistics
+        const filterRate = totalLines > 0 ? ((filteredLines / totalLines) * 100).toFixed(1) : '0';
+        logToExtension(`Output filter: processed ${filteredLines}/${totalLines} lines (${filterRate}% Cucumber-related)`, 'INFO');
       }
 
       // Determine test result based on failures count and exit code
