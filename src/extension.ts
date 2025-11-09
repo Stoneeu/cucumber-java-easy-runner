@@ -71,14 +71,16 @@ class CucumberOutputParser {
   }
 
   parseLine(line: string): StepResult | null {
-    logToExtension(`Parsing line: "${line}"`, 'DEBUG');
+    // Remove ANSI color codes first
+    const cleanLine = this.stripAnsiCodes(line);
+    logToExtension(`Parsing line: "${cleanLine}"`, 'DEBUG');
 
     // Pattern for Cucumber step execution with success/failure symbols
     // Examples:
     // "    ✔ And [MKT05A06] 存下取得的JWT身份驗證代碼    # tw.datahunter..."
     // "    ✘ When [MKT05A06] 創建動態分眾...    # tw.datahunter..."
     // "    Given I am on the login page    # StepDefinitions.loginPage()"
-    const stepMatch = line.match(/^\s*[✔✘✓✗×]?\s*(Given|When|Then|And|But)\s+(.+?)\s*(?:#|$)/);
+    const stepMatch = cleanLine.match(/^\s*[✔✘✓✗×]?\s*(Given|When|Then|And|But)\s+(.+?)\s*(?:#|$)/);
 
     if (stepMatch) {
       // If we were capturing an error for a previous step, finish it
@@ -93,7 +95,7 @@ class CucumberOutputParser {
       const stepText = stepMatch[2].trim();
 
       // Detect if the step already shows as failed (✘ symbol)
-      const isFailed = line.includes('✘') || line.includes('✗') || line.includes('×');
+      const isFailed = cleanLine.includes('✘') || cleanLine.includes('✗') || cleanLine.includes('×');
 
       // Create new step
       this.currentStep = {
@@ -118,8 +120,8 @@ class CucumberOutputParser {
     // Examples: "java.lang.AssertionError:", "Error:", "Exception:", indented error messages
     const errorPattern = /^\s+(java\.|org\.|Error|Exception|AssertionError|at\s+|Caused by:|\.\.\.)/;
 
-    if (errorPattern.test(line)) {
-      logToExtension(`Found error line: ${line.trim()}`, 'DEBUG');
+    if (errorPattern.test(cleanLine)) {
+      logToExtension(`Found error line: ${cleanLine.trim()}`, 'DEBUG');
 
       if (this.currentStep) {
         // Mark current step as failed
@@ -129,7 +131,7 @@ class CucumberOutputParser {
         }
 
         this.isCapturingError = true;
-        this.errorLines.push(line.trim());
+        this.errorLines.push(cleanLine.trim());
       }
       return null;
     }
@@ -137,9 +139,9 @@ class CucumberOutputParser {
     // If we have a current step and see a new step or certain markers, finalize the previous one
     if (this.currentStep && !this.isCapturingError) {
       // Check if this is a blank line, new scenario/feature, or another step symbol
-      const shouldFinalize = line.trim() === '' ||
-                            line.match(/^\s+(Scenario|Feature|Background)/) ||
-                            line.match(/^\s*[✔✘✓✗×]\s+(Given|When|Then|And|But)/);
+      const shouldFinalize = cleanLine.trim() === '' ||
+                            cleanLine.match(/^\s+(Scenario|Feature|Background)/) ||
+                            cleanLine.match(/^\s*[✔✘✓✗×]\s+(Given|When|Then|And|But)/);
 
       if (shouldFinalize) {
         // This step is done, notify about its status
@@ -151,10 +153,10 @@ class CucumberOutputParser {
     }
 
     // Continue capturing error lines if we're in error mode
-    if (this.isCapturingError && line.trim().length > 0) {
+    if (this.isCapturingError && cleanLine.trim().length > 0) {
       // Check if this looks like an error stack trace line
-      if (line.match(/^\s+(at\s+|\.\.\.|\d+\s+more|Caused by:)/)) {
-        this.errorLines.push(line.trim());
+      if (cleanLine.match(/^\s+(at\s+|\.\.\.|\d+\s+more|Caused by:)/)) {
+        this.errorLines.push(cleanLine.trim());
       } else {
         // End of error, finalize the failed step
         if (this.currentStep) {
@@ -168,6 +170,15 @@ class CucumberOutputParser {
     }
 
     return null;
+  }
+
+  /**
+   * Strip ANSI color codes from a string
+   * Example: "\x1b[32m[main]\x1b[0m" -> "[main]"
+   */
+  private stripAnsiCodes(str: string): string {
+    // eslint-disable-next-line no-control-regex
+    return str.replace(/\x1b\[[0-9;]*m/g, '');
   }
 
   private displayStepResult(result: StepResult): void {
@@ -539,9 +550,32 @@ class CucumberTestController {
       // Callback for real-time step status updates
       const onStepUpdate = (stepResult: StepResult) => {
         const stepKey = `${stepResult.keyword} ${stepResult.name}`;
-        const stepItem = stepItemsMap.get(stepKey);
+        let stepItem = stepItemsMap.get(stepKey);
 
         logToExtension(`onStepUpdate called: ${stepKey} - ${stepResult.status}`, 'INFO');
+
+        // If exact match fails, try fuzzy matching (remove tags like [MKT05A06])
+        if (!stepItem) {
+          logToExtension(`Exact match failed, trying fuzzy match...`, 'DEBUG');
+
+          // Remove common tags like [XXX] from the step name
+          const cleanedStepName = stepResult.name.replace(/\[[\w\d]+\]\s*/g, '').trim();
+          const cleanedStepKey = `${stepResult.keyword} ${cleanedStepName}`;
+
+          logToExtension(`Trying cleaned key: ${cleanedStepKey}`, 'DEBUG');
+
+          // Try to find a matching step by checking if the label contains the cleaned text
+          for (const [label, item] of stepItemsMap.entries()) {
+            // Remove tags from the stored label too
+            const cleanedLabel = label.replace(/\[[\w\d]+\]\s*/g, '').trim();
+
+            if (cleanedLabel === cleanedStepKey || label === cleanedStepKey) {
+              stepItem = item;
+              logToExtension(`Found fuzzy match: "${label}" matches "${stepKey}"`, 'INFO');
+              break;
+            }
+          }
+        }
 
         if (stepItem) {
           logToExtension(`Updating step in Test Explorer: ${stepKey} - ${stepResult.status}`, 'INFO');
@@ -569,7 +603,7 @@ class CucumberTestController {
               break;
           }
         } else {
-          logToExtension(`⚠️ Step not found in Test Explorer: ${stepKey}`, 'WARN');
+          logToExtension(`⚠️ Step not found in Test Explorer after fuzzy match: ${stepKey}`, 'WARN');
           logToExtension(`Available steps: ${Array.from(stepItemsMap.keys()).join(', ')}`, 'DEBUG');
         }
       };
