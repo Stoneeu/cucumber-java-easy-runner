@@ -5,11 +5,18 @@ import * as fs from 'fs';
 import { execFile } from 'child_process';
 import { spawn } from 'child_process';
 
+interface StepInfo {
+  keyword: string;  // Given, When, Then, And, But
+  text: string;     // Step text
+  lineNumber: number;
+}
+
 interface ScenarioInfo {
   name: string;
   lineNumber: number;
   exampleLineNumber?: number;
   examples?: ExampleInfo[];
+  steps?: StepInfo[];  // New: steps in this scenario
 }
 
 interface ExampleInfo {
@@ -51,10 +58,16 @@ class CucumberOutputParser {
   private showStepResults: boolean;
   private isCapturingError: boolean = false;
   private errorLines: string[] = [];
+  private onStepStatusChange?: (step: StepResult) => void;
 
-  constructor(outputChannel: vscode.OutputChannel, showStepResults: boolean = true) {
+  constructor(
+    outputChannel: vscode.OutputChannel,
+    showStepResults: boolean = true,
+    onStepStatusChange?: (step: StepResult) => void
+  ) {
     this.outputChannel = outputChannel;
     this.showStepResults = showStepResults;
+    this.onStepStatusChange = onStepStatusChange;
   }
 
   parseLine(line: string): StepResult | null {
@@ -139,10 +152,6 @@ class CucumberOutputParser {
   }
 
   private displayStepResult(result: StepResult): void {
-    if (!this.showStepResults) {
-      return;
-    }
-
     let icon = '';
 
     switch (result.status) {
@@ -162,12 +171,19 @@ class CucumberOutputParser {
         icon = '❓';
     }
 
-    const message = `${icon} ${result.keyword} ${result.name}`;
-    this.outputChannel.appendLine(message);
+    // Notify listeners about step status change
+    if (this.onStepStatusChange) {
+      this.onStepStatusChange(result);
+    }
 
-    if (result.errorMessage) {
-      this.outputChannel.appendLine(`   Error: ${result.errorMessage}`);
-      logToExtension(`Error details: ${result.errorMessage}`, 'ERROR');
+    if (this.showStepResults) {
+      const message = `${icon} ${result.keyword} ${result.name}`;
+      this.outputChannel.appendLine(message);
+
+      if (result.errorMessage) {
+        this.outputChannel.appendLine(`   Error: ${result.errorMessage}`);
+        logToExtension(`Error details: ${result.errorMessage}`, 'ERROR');
+      }
     }
   }
 
@@ -318,14 +334,33 @@ class CucumberTestController {
           scenario.name,
           uri
         );
-        
+
         scenarioItem.range = new vscode.Range(
           scenario.lineNumber - 1, 0,
           scenario.lineNumber - 1, 0
         );
 
         featureItem.children.add(scenarioItem);
-        
+
+        // Add steps as children of scenario
+        if (scenario.steps && scenario.steps.length > 0) {
+          for (const step of scenario.steps) {
+            const stepId = `${scenarioId}:step:${step.lineNumber}`;
+            const stepItem = this.controller.createTestItem(
+              stepId,
+              `${step.keyword} ${step.text}`,
+              uri
+            );
+
+            stepItem.range = new vscode.Range(
+              step.lineNumber - 1, 0,
+              step.lineNumber - 1, 0
+            );
+
+            scenarioItem.children.add(stepItem);
+          }
+        }
+
         // Add example rows as children of scenario
         if (scenario.examples && scenario.examples.length > 0) {
           for (const example of scenario.examples) {
@@ -335,12 +370,12 @@ class CucumberTestController {
               `Example: ${example.data.trim()}`,
               uri
             );
-            
+
             exampleItem.range = new vscode.Range(
               example.lineNumber - 1, 0,
               example.lineNumber - 1, 0
             );
-            
+
             scenarioItem.children.add(exampleItem);
           }
         }
@@ -367,7 +402,7 @@ class CucumberTestController {
   private parseFeatureFile(document: vscode.TextDocument): FeatureInfo | null {
     const text = document.getText();
     const lines = text.split('\n');
-    
+
     let featureName = '';
     let featureLineNumber = 0;
     const scenarios: ScenarioInfo[] = [];
@@ -375,7 +410,7 @@ class CucumberTestController {
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
-      
+
       if (line.startsWith('Feature:')) {
         featureName = line.substring(8).trim();
         featureLineNumber = i + 1;
@@ -384,7 +419,8 @@ class CucumberTestController {
         currentScenario = {
           name: scenarioName,
           lineNumber: i + 1,
-          examples: []
+          examples: [],
+          steps: []  // Initialize steps array
         };
         scenarios.push(currentScenario);
       } else if (line.startsWith('Scenario Outline:')) {
@@ -392,16 +428,29 @@ class CucumberTestController {
         currentScenario = {
           name: `${scenarioName} (Outline)`,
           lineNumber: i + 1,
-          examples: []
+          examples: [],
+          steps: []  // Initialize steps array
         };
         scenarios.push(currentScenario);
-              } else if (line.startsWith('|') && currentScenario && i > 0) {
+      } else if (line.startsWith('|') && currentScenario && i > 0) {
         // Check if this is an example row (not header)
         const exampleInfo = findExampleRowInfo(lines, i);
         if (exampleInfo && currentScenario.examples) {
           currentScenario.examples.push({
             lineNumber: i + 1,
             data: line
+          });
+        }
+      } else if (currentScenario && currentScenario.steps) {
+        // Check if this line is a step (Given/When/Then/And/But)
+        const stepMatch = line.match(/^(Given|When|Then|And|But)\s+(.+)/);
+        if (stepMatch) {
+          const keyword = stepMatch[1];
+          const stepText = stepMatch[2].trim();
+          currentScenario.steps.push({
+            keyword: keyword,
+            text: stepText,
+            lineNumber: i + 1
           });
         }
       }
@@ -446,18 +495,70 @@ class CucumberTestController {
 
   private async runSingleTest(testItem: vscode.TestItem, run: vscode.TestRun) {
     run.started(testItem);
-    
+
     try {
       const uri = testItem.uri!;
-      
+
+      // Create a map to track step test items by their text for real-time updates
+      const stepItemsMap = new Map<string, vscode.TestItem>();
+
+      // If running a scenario, collect all step children
+      if (testItem.id.includes(':scenario:') && !testItem.id.includes(':step:')) {
+        testItem.children.forEach(child => {
+          if (child.id.includes(':step:')) {
+            // Extract step text from label (format: "Given step text")
+            const stepText = child.label;
+            stepItemsMap.set(stepText, child);
+            // Mark all steps as started
+            run.started(child);
+            logToExtension(`Step queued: ${stepText}`, 'DEBUG');
+          }
+        });
+      }
+
+      // Callback for real-time step status updates
+      const onStepUpdate = (stepResult: StepResult) => {
+        const stepKey = `${stepResult.keyword} ${stepResult.name}`;
+        const stepItem = stepItemsMap.get(stepKey);
+
+        if (stepItem) {
+          logToExtension(`Updating step in Test Explorer: ${stepKey} - ${stepResult.status}`, 'INFO');
+
+          switch (stepResult.status) {
+            case 'passed':
+              run.passed(stepItem);
+              break;
+            case 'failed':
+              const errorMsg = stepResult.errorMessage || 'Step failed';
+              run.failed(stepItem, new vscode.TestMessage(errorMsg));
+              break;
+            case 'skipped':
+              run.skipped(stepItem);
+              break;
+          }
+        } else {
+          logToExtension(`Step not found in Test Explorer: ${stepKey}`, 'WARN');
+        }
+      };
+
       // Check test type based on ID structure
-      if (testItem.id.includes(':example:')) {
+      if (testItem.id.includes(':step:')) {
+        // This is a single step - cannot run independently, skip
+        run.skipped(testItem);
+        return;
+      } else if (testItem.id.includes(':example:')) {
         // This is an example row
         const parts = testItem.id.split(':');
         const scenarioLine = parseInt(parts[2]); // scenario line number
         const exampleLine = parseInt(parts[4]); // example line number
-        console.log(`Running example at scenario line ${scenarioLine}, example line ${exampleLine} for file ${uri.fsPath}`);
-        const exitCode = await runSelectedTestAndWait(uri, scenarioLine, exampleLine, (data) => run.appendOutput(data, undefined, testItem));
+        logToExtension(`Running example at scenario line ${scenarioLine}, example line ${exampleLine}`, 'INFO');
+        const exitCode = await runSelectedTestAndWait(
+          uri,
+          scenarioLine,
+          exampleLine,
+          (data) => run.appendOutput(data, undefined, testItem),
+          onStepUpdate
+        );
         if (exitCode === 0) {
           run.passed(testItem);
         } else {
@@ -466,9 +567,15 @@ class CucumberTestController {
       } else if (testItem.id.includes(':scenario:')) {
         // This is a scenario
         const parts = testItem.id.split(':scenario:');
-        const lineNumber = parseInt(parts[1]);
-        console.log(`Running scenario at line ${lineNumber} for file ${uri.fsPath}`);
-        const exitCode = await runSelectedTestAndWait(uri, lineNumber, undefined, (data) => run.appendOutput(data, undefined, testItem));
+        const lineNumber = parseInt(parts[1].split(':')[0]); // Get first part before any additional colons
+        logToExtension(`Running scenario at line ${lineNumber}`, 'INFO');
+        const exitCode = await runSelectedTestAndWait(
+          uri,
+          lineNumber,
+          undefined,
+          (data) => run.appendOutput(data, undefined, testItem),
+          onStepUpdate
+        );
         if (exitCode === 0) {
           run.passed(testItem);
         } else {
@@ -476,15 +583,21 @@ class CucumberTestController {
         }
       } else {
         // This is a feature file
-        console.log(`Running entire feature file ${uri.fsPath}`);
-        const exitCode = await runSelectedTestAndWait(uri, undefined, undefined, (data) => run.appendOutput(data, undefined, testItem));
+        logToExtension(`Running entire feature file`, 'INFO');
+        const exitCode = await runSelectedTestAndWait(
+          uri,
+          undefined,
+          undefined,
+          (data) => run.appendOutput(data, undefined, testItem),
+          onStepUpdate
+        );
         if (exitCode === 0) {
           run.passed(testItem);
         } else {
           run.failed(testItem, new vscode.TestMessage(`Test failed with exit code ${exitCode}`));
         }
       }
-      
+
     } catch (error) {
       console.error('Test execution error:', error);
       run.failed(testItem, new vscode.TestMessage(`Test failed: ${error}`));
@@ -1050,7 +1163,8 @@ async function runSelectedTestAndWait(
   uri: vscode.Uri,
   lineNumber?: number,
   exampleLine?: number,
-  onOutput?: (chunk: string) => void
+  onOutput?: (chunk: string) => void,
+  onStepUpdate?: (step: StepResult) => void
 ): Promise<number> {
   const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
   if (!workspaceFolder) {
@@ -1102,7 +1216,8 @@ async function runSelectedTestAndWait(
         testClassName,
         lineNumber,
         exampleLine,
-        onOutput
+        onOutput,
+        onStepUpdate
       );
     } else {
       // Java execution mode (original behavior)
@@ -1681,7 +1796,8 @@ async function runCucumberTestWithMavenResult(
   testClassName: string,
   lineNumber?: number,
   exampleLineNumber?: number,
-  onOutput?: (chunk: string) => void
+  onOutput?: (chunk: string) => void,
+  onStepUpdate?: (step: StepResult) => void
 ): Promise<number> {
   // Get configuration
   const config = vscode.workspace.getConfiguration('cucumberJavaEasyRunner');
@@ -1733,9 +1849,9 @@ async function runCucumberTestWithMavenResult(
 
   logToExtension(`Maven test command: mvn ${mvnArgs.join(' ')}`, 'INFO');
 
-  // Create output parser
-  const parser = cucumberOutputChannel ? new CucumberOutputParser(cucumberOutputChannel, showStepResults) : null;
-  logToExtension(`Output parser created, showStepResults: ${showStepResults}`, 'DEBUG');
+  // Create output parser with step status callback
+  const parser = cucumberOutputChannel ? new CucumberOutputParser(cucumberOutputChannel, showStepResults, onStepUpdate) : null;
+  logToExtension(`Output parser created, showStepResults: ${showStepResults}, callback: ${onStepUpdate ? 'enabled' : 'disabled'}`, 'DEBUG');
 
   // Merge environment variables
   const spawnEnv = { ...process.env, ...envVars };
