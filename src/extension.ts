@@ -49,6 +49,8 @@ class CucumberOutputParser {
   private outputChannel: vscode.OutputChannel;
   private currentStep: StepResult | null = null;
   private showStepResults: boolean;
+  private isCapturingError: boolean = false;
+  private errorLines: string[] = [];
 
   constructor(outputChannel: vscode.OutputChannel, showStepResults: boolean = true) {
     this.outputChannel = outputChannel;
@@ -56,48 +58,80 @@ class CucumberOutputParser {
   }
 
   parseLine(line: string): StepResult | null {
-    // Pattern for step execution: "  ✔ Given I am on the login page"
-    const passedMatch = line.match(/^\s*[✔✓]\s+(Given|When|Then|And|But)\s+(.+)$/);
-    if (passedMatch) {
-      const result: StepResult = {
-        keyword: passedMatch[1],
-        name: passedMatch[2],
-        status: 'passed'
-      };
-      this.displayStepResult(result);
-      return result;
-    }
+    logToExtension(`Parsing line: "${line}"`, 'DEBUG');
 
-    // Pattern for failed step: "  ✘ When I enter invalid credentials"
-    const failedMatch = line.match(/^\s*[✘✗×]\s+(Given|When|Then|And|But)\s+(.+)$/);
-    if (failedMatch) {
+    // Pattern for Cucumber step execution (standard format)
+    // Example: "    Given I am on the login page                 # StepDefinitions.loginPage()"
+    const stepMatch = line.match(/^\s+(Given|When|Then|And|But)\s+(.+?)\s*(?:#|$)/);
+
+    if (stepMatch) {
+      // If we were capturing an error for a previous step, finish it
+      if (this.currentStep && this.isCapturingError) {
+        this.currentStep.errorMessage = this.errorLines.join('\n');
+        this.displayStepResult(this.currentStep);
+        this.errorLines = [];
+        this.isCapturingError = false;
+      }
+
+      const keyword = stepMatch[1];
+      const stepText = stepMatch[2].trim();
+
+      // Create new step (we'll determine status later)
       this.currentStep = {
-        keyword: failedMatch[1],
-        name: failedMatch[2],
-        status: 'failed'
+        keyword: keyword,
+        name: stepText,
+        status: 'passed' // Default to passed, will change if we see an error
       };
-      this.displayStepResult(this.currentStep);
+
+      logToExtension(`Found step: ${keyword} ${stepText}`, 'DEBUG');
       return this.currentStep;
     }
 
-    // Pattern for skipped step: "  - Given ..."
-    const skippedMatch = line.match(/^\s*[-−]\s+(Given|When|Then|And|But)\s+(.+)$/);
-    if (skippedMatch) {
-      const result: StepResult = {
-        keyword: skippedMatch[1],
-        name: skippedMatch[2],
-        status: 'skipped'
-      };
-      this.displayStepResult(result);
-      return result;
+    // Check if this line indicates an error/exception
+    // Examples: "java.lang.AssertionError:", "Error:", "Exception:", indented error messages
+    const errorPattern = /^\s+(java\.|org\.|Error|Exception|AssertionError|at\s+|Caused by:|\.\.\.)/;
+
+    if (errorPattern.test(line)) {
+      logToExtension(`Found error line: ${line.trim()}`, 'DEBUG');
+
+      if (this.currentStep) {
+        // Mark current step as failed
+        if (this.currentStep.status === 'passed') {
+          this.currentStep.status = 'failed';
+          logToExtension(`Marking step as FAILED: ${this.currentStep.keyword} ${this.currentStep.name}`, 'WARN');
+        }
+
+        this.isCapturingError = true;
+        this.errorLines.push(line.trim());
+      }
+      return null;
     }
 
-    // Capture error messages for failed steps
-    if (this.currentStep && this.currentStep.status === 'failed' && line.trim().length > 0) {
-      if (!this.currentStep.errorMessage) {
-        this.currentStep.errorMessage = line.trim();
+    // If we're not in an error and we have a current step, it passed
+    if (this.currentStep && !this.isCapturingError) {
+      // Check if this is a blank line or new scenario/feature - finalize the step
+      if (line.trim() === '' || line.match(/^\s+(Scenario|Feature|Background)/)) {
+        this.displayStepResult(this.currentStep);
+        const result = this.currentStep;
+        this.currentStep = null;
+        return result;
+      }
+    }
+
+    // Continue capturing error lines if we're in error mode
+    if (this.isCapturingError && line.trim().length > 0) {
+      // Check if this looks like an error stack trace line
+      if (line.match(/^\s+(at\s+|\.\.\.|\d+\s+more|Caused by:)/)) {
+        this.errorLines.push(line.trim());
       } else {
-        this.currentStep.errorMessage += '\n' + line.trim();
+        // End of error, finalize the failed step
+        if (this.currentStep) {
+          this.currentStep.errorMessage = this.errorLines.join('\n');
+          this.displayStepResult(this.currentStep);
+          this.errorLines = [];
+          this.isCapturingError = false;
+          this.currentStep = null;
+        }
       }
     }
 
@@ -110,20 +144,19 @@ class CucumberOutputParser {
     }
 
     let icon = '';
-    let color = '';
 
     switch (result.status) {
       case 'passed':
         icon = '✅';
-        color = '';
+        logToExtension(`Step PASSED: ${result.keyword} ${result.name}`, 'INFO');
         break;
       case 'failed':
         icon = '❌';
-        color = '';
+        logToExtension(`Step FAILED: ${result.keyword} ${result.name}`, 'ERROR');
         break;
       case 'skipped':
         icon = '⊝';
-        color = '';
+        logToExtension(`Step SKIPPED: ${result.keyword} ${result.name}`, 'WARN');
         break;
       default:
         icon = '❓';
@@ -134,11 +167,27 @@ class CucumberOutputParser {
 
     if (result.errorMessage) {
       this.outputChannel.appendLine(`   Error: ${result.errorMessage}`);
+      logToExtension(`Error details: ${result.errorMessage}`, 'ERROR');
+    }
+  }
+
+  finalize(): void {
+    // Finalize any pending step
+    if (this.currentStep) {
+      if (this.isCapturingError) {
+        this.currentStep.errorMessage = this.errorLines.join('\n');
+      }
+      this.displayStepResult(this.currentStep);
+      this.currentStep = null;
+      this.isCapturingError = false;
+      this.errorLines = [];
     }
   }
 
   reset(): void {
     this.currentStep = null;
+    this.isCapturingError = false;
+    this.errorLines = [];
   }
 }
 
@@ -600,6 +649,9 @@ let globalTestController: CucumberTestController | undefined;
 // Global output channel for Cucumber results
 let cucumberOutputChannel: vscode.OutputChannel | undefined;
 
+// Global output channel for Extension logs
+let extensionLogChannel: vscode.OutputChannel | undefined;
+
 // Global status bar item for execution mode
 let executionModeStatusBar: vscode.StatusBarItem | undefined;
 
@@ -608,6 +660,20 @@ let globalContext: vscode.ExtensionContext | undefined;
 
 // Test class mapping cache (workspace state)
 const TEST_CLASS_CACHE_KEY = 'cucumberTestClassMapping';
+
+/**
+ * Logs a message to the extension log channel
+ */
+function logToExtension(message: string, level: 'INFO' | 'WARN' | 'ERROR' | 'DEBUG' = 'INFO'): void {
+  if (!extensionLogChannel) return;
+
+  const timestamp = new Date().toLocaleTimeString();
+  const prefix = `[${timestamp}] [${level}]`;
+  extensionLogChannel.appendLine(`${prefix} ${message}`);
+
+  // Also log to console for development
+  console.log(`${prefix} ${message}`);
+}
 
 export function activate(context: vscode.ExtensionContext) {
   globalContext = context;
@@ -621,6 +687,11 @@ export function activate(context: vscode.ExtensionContext) {
     }
   }
 
+  // Create output channel for Extension logs
+  extensionLogChannel = vscode.window.createOutputChannel('Cucumber Java Easy Runner - Logs');
+  context.subscriptions.push(extensionLogChannel);
+  logToExtension('Extension activated', 'INFO');
+
   // Create output channel for Cucumber results
   cucumberOutputChannel = vscode.window.createOutputChannel('Cucumber Test Results');
   context.subscriptions.push(cucumberOutputChannel);
@@ -632,9 +703,11 @@ export function activate(context: vscode.ExtensionContext) {
   updateExecutionModeStatusBar();
   executionModeStatusBar.show();
   context.subscriptions.push(executionModeStatusBar);
+  logToExtension('Status bar created', 'DEBUG');
 
   // Create new test controller
   globalTestController = new CucumberTestController(context);
+  logToExtension('Test controller initialized', 'INFO');
   
   // Check if CodeLens should be enabled (default: false since we have Test Explorer)
   const config = vscode.workspace.getConfiguration('cucumberJavaEasyRunner');
@@ -856,13 +929,13 @@ async function runSelectedTest(uri: vscode.Uri, lineNumber?: number, exampleLine
     runMode = exampleLine ? 'example' : 'scenario';
   }
 
-  console.log(`Run mode: ${runMode}`);
-  console.log(`Execution mode: ${executionMode}`);
-  console.log(`Module path: ${moduleInfo.modulePath}`);
-  console.log(`Module relative path: ${moduleInfo.moduleRelativePath}`);
-  console.log(`Feature: ${relativePath}`);
-  console.log(`Scenario line: ${lineNumber || 'entire feature'}`);
-  console.log(`Example line: ${exampleLine || 'all scenarios'}`);
+  logToExtension(`Run mode: ${runMode}`, 'INFO');
+  logToExtension(`Execution mode: ${executionMode}`, 'INFO');
+  logToExtension(`Module path: ${moduleInfo.modulePath}`, 'DEBUG');
+  logToExtension(`Module relative path: ${moduleInfo.moduleRelativePath}`, 'DEBUG');
+  logToExtension(`Feature: ${relativePath}`, 'INFO');
+  logToExtension(`Scenario line: ${lineNumber || 'entire feature'}`, 'DEBUG');
+  logToExtension(`Example line: ${exampleLine || 'all scenarios'}`, 'DEBUG');
 
   // Clear and show output channel
   if (cucumberOutputChannel) {
@@ -1658,22 +1731,28 @@ async function runCucumberTestWithMavenResult(
     mvnArgs.push(...mavenArgs.split(' ').filter(arg => arg.length > 0));
   }
 
-  console.log(`Maven test args: ${mvnArgs.join(' ')}`);
+  logToExtension(`Maven test command: mvn ${mvnArgs.join(' ')}`, 'INFO');
 
   // Create output parser
   const parser = cucumberOutputChannel ? new CucumberOutputParser(cucumberOutputChannel, showStepResults) : null;
+  logToExtension(`Output parser created, showStepResults: ${showStepResults}`, 'DEBUG');
 
   // Merge environment variables
   const spawnEnv = { ...process.env, ...envVars };
+  if (Object.keys(envVars).length > 0) {
+    logToExtension(`Environment variables: ${JSON.stringify(envVars)}`, 'DEBUG');
+  }
 
   // Execute Maven test
   const child = spawn('mvn', mvnArgs, { cwd: workspaceRoot, env: spawnEnv });
+  logToExtension(`Maven process started in: ${workspaceRoot}`, 'INFO');
 
   let testSummary = {
     scenarios: 0,
     steps: 0,
     failures: 0,
-    skipped: 0
+    skipped: 0,
+    passed: 0
   };
 
   return await new Promise<number>((resolve) => {
@@ -1686,20 +1765,36 @@ async function runCucumberTestWithMavenResult(
         for (const line of lines) {
           parser.parseLine(line);
 
-          // Parse test summary
-          const scenarioMatch = line.match(/(\d+)\s+scenarios?\s+\(([^)]+)\)/i);
+          // Parse test summary - Pattern: "5 Scenarios (2 failed, 3 passed)"
+          const scenarioMatch = line.match(/(\d+)\s+Scenarios?\s+\(([^)]+)\)/i);
           if (scenarioMatch) {
             testSummary.scenarios = parseInt(scenarioMatch[1]);
+            const details = scenarioMatch[2];
+
+            const failedMatch = details.match(/(\d+)\s+failed/);
+            const passedMatch = details.match(/(\d+)\s+passed/);
+            const skippedMatch = details.match(/(\d+)\s+skipped/);
+
+            if (failedMatch) testSummary.failures = parseInt(failedMatch[1]);
+            if (passedMatch) testSummary.passed = parseInt(passedMatch[1]);
+            if (skippedMatch) testSummary.skipped = parseInt(skippedMatch[1]);
+
+            logToExtension(`Parsed scenario summary: ${testSummary.scenarios} total, ${testSummary.failures} failed, ${testSummary.passed} passed`, 'INFO');
           }
 
-          const stepsMatch = line.match(/(\d+)\s+steps?\s+\(([^)]+)\)/i);
+          // Parse step summary - Pattern: "15 Steps (2 failed, 3 skipped, 10 passed)"
+          const stepsMatch = line.match(/(\d+)\s+Steps?\s+\(([^)]+)\)/i);
           if (stepsMatch) {
             testSummary.steps = parseInt(stepsMatch[1]);
             const details = stepsMatch[2];
+
             const failedMatch = details.match(/(\d+)\s+failed/);
             const skippedMatch = details.match(/(\d+)\s+skipped/);
+
             if (failedMatch) testSummary.failures = parseInt(failedMatch[1]);
             if (skippedMatch) testSummary.skipped = parseInt(skippedMatch[1]);
+
+            logToExtension(`Parsed steps summary: ${testSummary.steps} total, ${testSummary.failures} failed, ${testSummary.skipped} skipped`, 'INFO');
           }
         }
       }
@@ -1708,11 +1803,24 @@ async function runCucumberTestWithMavenResult(
     });
 
     child.stderr?.on('data', (chunk: Buffer) => {
-      if (onOutput) onOutput(chunk.toString());
+      const errorOutput = chunk.toString();
+      logToExtension(`Maven stderr: ${errorOutput.substring(0, 200)}`, 'WARN');
+      if (onOutput) onOutput(errorOutput);
     });
 
     child.on('close', (code) => {
       const exitCode = typeof code === 'number' ? code : 1;
+      logToExtension(`Maven process exited with code: ${exitCode}`, 'INFO');
+
+      // Finalize parser to display any pending steps
+      if (parser) {
+        parser.finalize();
+        logToExtension('Parser finalized', 'DEBUG');
+      }
+
+      // Determine test result based on failures count and exit code
+      const testsPassed = testSummary.failures === 0 && exitCode === 0;
+      logToExtension(`Test result: ${testsPassed ? 'PASSED' : 'FAILED'}, failures: ${testSummary.failures}, exitCode: ${exitCode}`, 'INFO');
 
       // Show test summary in output channel
       if (cucumberOutputChannel) {
@@ -1721,19 +1829,26 @@ async function runCucumberTestWithMavenResult(
         cucumberOutputChannel.appendLine('═══════════════════════════════════════════');
         cucumberOutputChannel.appendLine(`Scenarios: ${testSummary.scenarios}`);
         cucumberOutputChannel.appendLine(`Steps: ${testSummary.steps}`);
+
+        if (testSummary.passed > 0) {
+          cucumberOutputChannel.appendLine(`✅ Passed: ${testSummary.passed}`);
+        }
         if (testSummary.failures > 0) {
           cucumberOutputChannel.appendLine(`❌ Failures: ${testSummary.failures}`);
         }
         if (testSummary.skipped > 0) {
           cucumberOutputChannel.appendLine(`⊝ Skipped: ${testSummary.skipped}`);
         }
+        cucumberOutputChannel.appendLine(`\nExit Code: ${exitCode}`);
         cucumberOutputChannel.appendLine('═══════════════════════════════════════════\n');
 
-        // Show notification
-        if (exitCode === 0) {
+        // Show notification based on actual test result
+        if (testsPassed) {
           vscode.window.showInformationMessage(`✅ All tests passed! (${testSummary.scenarios} scenarios, ${testSummary.steps} steps)`);
+          logToExtension('Showing success notification', 'INFO');
         } else {
-          vscode.window.showErrorMessage(`❌ Tests failed! (${testSummary.failures} failures)`);
+          vscode.window.showErrorMessage(`❌ Tests failed! (${testSummary.failures} ${testSummary.failures === 1 ? 'failure' : 'failures'})`);
+          logToExtension('Showing failure notification', 'ERROR');
         }
       }
 
