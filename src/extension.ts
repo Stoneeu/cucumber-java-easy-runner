@@ -586,27 +586,37 @@ class CucumberTestController {
 
         if (stepItem) {
           logToExtension(`Updating step in Test Explorer: ${stepKey} - ${stepResult.status}`, 'INFO');
+          logToExtension(`  Step ID: ${stepItem.id}`, 'DEBUG');
+          logToExtension(`  Step label: ${stepItem.label}`, 'DEBUG');
+
+          // IMPORTANT: Mark step as started first, so Test Explorer shows it's running
+          run.started(stepItem);
+          logToExtension(`  TestRun.started() called for: ${stepItem.id}`, 'DEBUG');
 
           switch (stepResult.status) {
             case 'passed':
               run.passed(stepItem);
               logToExtension(`✅ Step PASSED in UI: ${stepKey}`, 'INFO');
+              logToExtension(`  TestRun.passed() called for: ${stepItem.id}`, 'DEBUG');
               break;
             case 'failed':
               hasFailedStep = true; // Mark that we have a failed step
               const errorMsg = stepResult.errorMessage || 'Step failed';
               run.failed(stepItem, new vscode.TestMessage(errorMsg));
               logToExtension(`❌ Step FAILED in UI: ${stepKey}`, 'ERROR');
+              logToExtension(`  TestRun.failed() called for: ${stepItem.id}`, 'DEBUG');
 
               // Immediately mark the scenario as failed if it's a scenario test
               if (testItem.id.includes(':scenario:')) {
                 logToExtension(`Marking scenario as FAILED due to step failure: ${stepKey}`, 'ERROR');
                 run.failed(testItem, new vscode.TestMessage(`Step failed: ${stepKey}\n${errorMsg}`));
+                logToExtension(`  TestRun.failed() called for scenario: ${testItem.id}`, 'DEBUG');
               }
               break;
             case 'skipped':
               run.skipped(stepItem);
               logToExtension(`⊝ Step SKIPPED in UI: ${stepKey}`, 'WARN');
+              logToExtension(`  TestRun.skipped() called for: ${stepItem.id}`, 'DEBUG');
               break;
           }
         } else {
