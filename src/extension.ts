@@ -75,12 +75,13 @@ class CucumberOutputParser {
     const cleanLine = this.stripAnsiCodes(line);
     logToExtension(`Parsing line: "${cleanLine}"`, 'DEBUG');
 
-    // Pattern for Cucumber step execution with success/failure symbols
+    // Pattern for Cucumber step execution with success/failure/skipped symbols
     // Examples:
     // "    ✔ And [MKT05A06] 存下取得的JWT身份驗證代碼    # tw.datahunter..."
     // "    ✘ When [MKT05A06] 創建動態分眾...    # tw.datahunter..."
+    // "    ↷ Then [MKT05A06] 驗證分眾創建成功    # tw.datahunter..."
     // "    Given I am on the login page    # StepDefinitions.loginPage()"
-    const stepMatch = cleanLine.match(/^\s*[✔✘✓✗×]?\s*(Given|When|Then|And|But)\s+(.+?)\s*(?:#|$)/);
+    const stepMatch = cleanLine.match(/^\s*[✔✘✓✗×↷⊝−]?\s*(Given|When|Then|And|But)\s+(.+?)\s*(?:#|$)/);
 
     if (stepMatch) {
       // If we were capturing an error for a previous step, finish it
@@ -94,23 +95,33 @@ class CucumberOutputParser {
       const keyword = stepMatch[1];
       const stepText = stepMatch[2].trim();
 
-      // Detect if the step already shows as failed (✘ symbol)
-      const isFailed = cleanLine.includes('✘') || cleanLine.includes('✗') || cleanLine.includes('×');
+      // Detect step status from symbol
+      let status: 'passed' | 'failed' | 'skipped';
+      if (cleanLine.includes('✘') || cleanLine.includes('✗') || cleanLine.includes('×')) {
+        status = 'failed';
+      } else if (cleanLine.includes('↷') || cleanLine.includes('⊝') || cleanLine.includes('−')) {
+        status = 'skipped';
+      } else {
+        status = 'passed';
+      }
 
       // Create new step
       this.currentStep = {
         keyword: keyword,
         name: stepText,
-        status: isFailed ? 'failed' : 'passed'
+        status: status
       };
 
       logToExtension(`Found step: ${keyword} ${stepText}, status: ${this.currentStep.status}`, 'INFO');
 
-      // If step is already marked as failed, we'll wait for error details
-      // If step is passed, we can notify immediately (unless error follows)
-      if (!isFailed) {
-        // For passed steps, notify after a brief delay to see if error follows
-        // We'll finalize in the next line if no error appears
+      // For failed steps, we'll wait for error details
+      // For passed/skipped steps, we can notify immediately
+      if (status === 'skipped') {
+        // Skipped steps don't have error details, notify immediately
+        this.displayStepResult(this.currentStep);
+        const result = this.currentStep;
+        this.currentStep = null;
+        return result;
       }
 
       return this.currentStep;
@@ -123,13 +134,9 @@ class CucumberOutputParser {
     if (errorPattern.test(cleanLine)) {
       logToExtension(`Found error line: ${cleanLine.trim()}`, 'DEBUG');
 
-      if (this.currentStep) {
-        // Mark current step as failed
-        if (this.currentStep.status === 'passed') {
-          this.currentStep.status = 'failed';
-          logToExtension(`Marking step as FAILED: ${this.currentStep.keyword} ${this.currentStep.name}`, 'WARN');
-        }
-
+      // Only capture error details if current step is already marked as failed
+      // Don't change step status based on error stack traces - rely on Cucumber's ✘ symbol
+      if (this.currentStep && this.currentStep.status === 'failed') {
         this.isCapturingError = true;
         this.errorLines.push(cleanLine.trim());
       }
