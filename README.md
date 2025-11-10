@@ -157,6 +157,19 @@ If auto-detection fails, you'll be prompted to enter your glue path manually (e.
 - Check Cucumber dependencies in pom.xml
 - Ensure Java and Maven are properly installed
 
+**Real-time status updates not working:**
+- Check "Cucumber Java Easy Runner - Logs" output channel for debugging info
+- Verify Cucumber is outputting step symbols (✔, ✘, ↷) in console
+- If using Maven mode, ensure grep is available on your system
+- Enable `showStepResults` setting for detailed step output
+- For step matching issues, check logs for "Step not found" warnings
+
+**Steps stuck in "running" state:**
+- This may occur if Cucumber output format changes
+- Check extension logs for parsing errors
+- Try toggling between Java and Maven execution modes
+- Verify your Cucumber version is compatible (6.x or higher recommended)
+
 ## 🛠️ Development
 
 ```bash
