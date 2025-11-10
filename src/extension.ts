@@ -37,7 +37,7 @@ interface ModuleInfo {
   workspaceRoot: string;
 }
 
-interface StepResult {
+export interface StepResult {
   keyword: string;
   name: string;
   status: 'passed' | 'failed' | 'skipped' | 'pending' | 'undefined';
@@ -52,17 +52,17 @@ interface TestClassMapping {
 /**
  * Cucumber output parser for real-time step results
  */
-class CucumberOutputParser {
+export class CucumberOutputParser {
   private outputChannel: vscode.OutputChannel;
   private currentStep: StepResult | null = null;
   private showStepResults: boolean;
-  private isCapturingError: boolean = false;
+  private isCapturingError = false;
   private errorLines: string[] = [];
   private onStepStatusChange?: (step: StepResult) => void;
 
   constructor(
     outputChannel: vscode.OutputChannel,
-    showStepResults: boolean = true,
+    showStepResults = true,
     onStepStatusChange?: (step: StepResult) => void
   ) {
     this.outputChannel = outputChannel;
@@ -73,7 +73,9 @@ class CucumberOutputParser {
   parseLine(line: string): StepResult | null {
     // Remove ANSI color codes first
     const cleanLine = this.stripAnsiCodes(line);
-    logToExtension(`Parsing line: "${cleanLine}"`, 'DEBUG');
+    if (extensionLogChannel) {
+      logToExtension(`Parsing line: "${cleanLine}"`, 'DEBUG');
+    }
 
     // Pattern for Cucumber step execution with success/failure/skipped symbols
     // Examples:
@@ -112,11 +114,20 @@ class CucumberOutputParser {
         status: status
       };
 
-      logToExtension(`Found step: ${keyword} ${stepText}, status: ${this.currentStep.status}`, 'INFO');
+      if (extensionLogChannel) {
+        logToExtension(`Found step: ${keyword} ${stepText}, status: ${this.currentStep.status}`, 'INFO');
+      }
 
+      // For passed steps, notify immediately since they don't have error details
       // For failed steps, we'll wait for error details
-      // For passed/skipped steps, we can notify immediately
-      if (status === 'skipped') {
+      // For skipped steps, notify immediately
+      if (status === 'passed') {
+        // Passed steps don't have error details, notify immediately
+        this.displayStepResult(this.currentStep);
+        const result = this.currentStep;
+        this.currentStep = null;
+        return result;
+      } else if (status === 'skipped') {
         // Skipped steps don't have error details, notify immediately
         this.displayStepResult(this.currentStep);
         const result = this.currentStep;
@@ -124,23 +135,35 @@ class CucumberOutputParser {
         return result;
       }
 
+      // For failed steps, keep currentStep and wait for error details
       return this.currentStep;
     }
 
-    // Check if this line indicates an error/exception
-    // Examples: "java.lang.AssertionError:", "Error:", "Exception:", indented error messages
-    const errorPattern = /^\s+(java\.|org\.|Error|Exception|AssertionError|at\s+|Caused by:|\.\.\.)/;
+    // Check if this line indicates an error/exception from Cucumber (not application logs)
+    // Cucumber error messages are indented and don't have timestamps
+    // Examples: "      org.opentest4j.AssertionFailedError:", "      at java.base/..."
+    // EXCLUDE: "2025-11-09 20:46:31.944 [grpc-default-executor-0] ERROR" (application logs)
+    
+    // First, check if this is an application log line (has timestamp pattern)
+    const isApplicationLog = /^\s*\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/.test(cleanLine);
+    
+    if (!isApplicationLog) {
+      // Now check if this is a Cucumber error/stack trace line
+      const errorPattern = /^\s+(java\.|org\.|Error|Exception|AssertionError|at\s+|Caused by:|\.\.\.)/;
 
-    if (errorPattern.test(cleanLine)) {
-      logToExtension(`Found error line: ${cleanLine.trim()}`, 'DEBUG');
+      if (errorPattern.test(cleanLine)) {
+        if (extensionLogChannel) {
+          logToExtension(`Found Cucumber error line: ${cleanLine.trim()}`, 'DEBUG');
+        }
 
-      // Only capture error details if current step is already marked as failed
-      // Don't change step status based on error stack traces - rely on Cucumber's ✘ symbol
-      if (this.currentStep && this.currentStep.status === 'failed') {
-        this.isCapturingError = true;
-        this.errorLines.push(cleanLine.trim());
+        // Only capture error details if current step is already marked as failed
+        // Don't change step status based on error stack traces - rely on Cucumber's ✘ symbol
+        if (this.currentStep && this.currentStep.status === 'failed') {
+          this.isCapturingError = true;
+          this.errorLines.push(cleanLine.trim());
+        }
+        return null;
       }
-      return null;
     }
 
     // If we have a current step and see a new step or certain markers, finalize the previous one
@@ -194,15 +217,21 @@ class CucumberOutputParser {
     switch (result.status) {
       case 'passed':
         icon = '✅';
-        logToExtension(`Step PASSED: ${result.keyword} ${result.name}`, 'INFO');
+        if (extensionLogChannel) {
+          logToExtension(`Step PASSED: ${result.keyword} ${result.name}`, 'INFO');
+        }
         break;
       case 'failed':
         icon = '❌';
-        logToExtension(`Step FAILED: ${result.keyword} ${result.name}`, 'ERROR');
+        if (extensionLogChannel) {
+          logToExtension(`Step FAILED: ${result.keyword} ${result.name}`, 'ERROR');
+        }
         break;
       case 'skipped':
         icon = '⊝';
-        logToExtension(`Step SKIPPED: ${result.keyword} ${result.name}`, 'WARN');
+        if (extensionLogChannel) {
+          logToExtension(`Step SKIPPED: ${result.keyword} ${result.name}`, 'WARN');
+        }
         break;
       default:
         icon = '❓';
@@ -219,7 +248,9 @@ class CucumberOutputParser {
 
       if (result.errorMessage) {
         this.outputChannel.appendLine(`   Error: ${result.errorMessage}`);
-        logToExtension(`Error details: ${result.errorMessage}`, 'ERROR');
+        if (extensionLogChannel) {
+          logToExtension(`Error details: ${result.errorMessage}`, 'ERROR');
+        }
       }
     }
   }
@@ -341,7 +372,7 @@ class CucumberTestController {
       const document = await vscode.workspace.openTextDocument(uri);
       const featureInfo = this.parseFeatureFile(document);
       
-      if (!featureInfo) return;
+      if (!featureInfo) {return;}
 
       // Create unique feature ID using normalized file path
       const featureId = path.normalize(uri.fsPath);
@@ -493,7 +524,7 @@ class CucumberTestController {
       }
     }
 
-    if (!featureName) return null;
+    if (!featureName) {return null;}
 
     return {
       name: featureName,
@@ -531,6 +562,8 @@ class CucumberTestController {
   }
 
   private async runSingleTest(testItem: vscode.TestItem, run: vscode.TestRun) {
+    // TestRun lifecycle: started() → running → passed()/failed()/skipped() → end()
+    // Mark test item as started to show "preparing" state in Test Explorer
     run.started(testItem);
 
     try {
@@ -539,88 +572,226 @@ class CucumberTestController {
       // Create a map to track step test items by their text for real-time updates
       const stepItemsMap = new Map<string, vscode.TestItem>();
       let hasFailedStep = false; // Track if any step has failed
+      
+      // Track Background/Before hook steps (not in feature file scenario)
+      let beforeStepsContainer: vscode.TestItem | undefined = undefined;
+      const backgroundStepsMap = new Map<string, vscode.TestItem>(); // Track Background steps by text
+      const processedSteps = new Set<string>(); // Track which steps have been updated
 
-      // If running a scenario, collect all step children
+      // If running a scenario, collect all step children IN ORDER (sorted by line number)
       if (testItem.id.includes(':scenario:') && !testItem.id.includes(':step:')) {
+        logToExtension(`╔═══════════════════════════════════════════════════════════════╗`, 'INFO');
+        logToExtension(`║ Initializing Test Run - Scenario Steps                       ║`, 'INFO');
+        logToExtension(`╚═══════════════════════════════════════════════════════════════╝`, 'INFO');
+        
+        // Collect all step children into an array
+        const stepChildren: vscode.TestItem[] = [];
         testItem.children.forEach(child => {
           if (child.id.includes(':step:')) {
-            // Extract step text from label (format: "Given step text")
-            const stepText = child.label;
-            stepItemsMap.set(stepText, child);
-            // Don't mark steps as started here - they'll be marked when actually executed
-            logToExtension(`Step registered: ${stepText}`, 'DEBUG');
+            stepChildren.push(child);
           }
         });
+
+        // Sort by line number (extracted from step ID: "...:step:lineNumber")
+        stepChildren.sort((a, b) => {
+          const lineA = parseInt(a.id.split(':step:')[1]) || 0;
+          const lineB = parseInt(b.id.split(':step:')[1]) || 0;
+          return lineA - lineB;
+        });
+
+        logToExtension(`📋 Pre-registering ${stepChildren.length} steps in Test Explorer (in order):`, 'INFO');
+        
+        // Add to map in sorted order AND mark all as started immediately
+        // This makes all steps visible in Test Result panel from the beginning
+        // IMPORTANT: Use step ID as map key (not stepText) to handle duplicate step texts
+        for (let i = 0; i < stepChildren.length; i++) {
+          const child = stepChildren[i];
+          const stepText = child.label;
+          const lineNum = child.id.split(':step:')[1];
+          const stepId = child.id; // Use unique ID as key
+          
+          // Add to map using step ID as key (handles duplicate step texts)
+          stepItemsMap.set(stepId, child);
+          
+          // Mark step as started immediately to show in Test Result
+          run.started(child);
+          
+          logToExtension(`  [${i + 1}/${stepChildren.length}] ▶️  Started: "${stepText}" (line ${lineNum}, id: ${child.id})`, 'INFO');
+        }
+        
+        logToExtension(`✅ All ${stepItemsMap.size} steps initialized and visible in Test Result panel`, 'INFO');
+        logToExtension(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`, 'INFO');
+        
+        // Create a "Before" container for Background/Before hook steps
+        // This will be populated dynamically when we detect steps not in stepItemsMap
+        if (testItem.id.includes(':scenario:')) {
+          const beforeId = `${testItem.id}:before`;
+          beforeStepsContainer = this.controller.createTestItem(
+            beforeId,
+            '⚙️ Before (Background/Hooks)',
+            uri
+          );
+          // Add as first child of scenario
+          testItem.children.add(beforeStepsContainer);
+          logToExtension(`📦 Created Before steps container: ${beforeId}`, 'INFO');
+        }
       }
 
       // Callback for real-time step status updates
+      // Each step goes through lifecycle: started() → passed()/failed()/skipped()
+      // This callback is invoked by CucumberOutputParser when it detects step completion
       const onStepUpdate = (stepResult: StepResult) => {
-        const stepKey = `${stepResult.keyword} ${stepResult.name}`;
-        let stepItem = stepItemsMap.get(stepKey);
+        const stepText = `${stepResult.keyword} ${stepResult.name}`;
+        let stepItem: vscode.TestItem | undefined = undefined;
 
-        logToExtension(`onStepUpdate called: ${stepKey} - ${stepResult.status}`, 'INFO');
+        logToExtension(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`, 'INFO');
+        logToExtension(`onStepUpdate called:`, 'INFO');
+        logToExtension(`  stepText from Maven: "${stepText}"`, 'INFO');
+        logToExtension(`  status: ${stepResult.status}`, 'INFO');
+        logToExtension(`  stepItemsMap size: ${stepItemsMap.size}`, 'INFO');
 
-        // If exact match fails, try fuzzy matching (remove tags like [MKT05A06])
-        if (!stepItem) {
-          logToExtension(`Exact match failed, trying fuzzy match...`, 'DEBUG');
-
-          // Remove common tags like [XXX] from the step name
-          const cleanedStepName = stepResult.name.replace(/\[[\w\d]+\]\s*/g, '').trim();
-          const cleanedStepKey = `${stepResult.keyword} ${cleanedStepName}`;
-
-          logToExtension(`Trying cleaned key: ${cleanedStepKey}`, 'DEBUG');
-
-          // Try to find a matching step by checking if the label contains the cleaned text
-          for (const [label, item] of stepItemsMap.entries()) {
-            // Remove tags from the stored label too
-            const cleanedLabel = label.replace(/\[[\w\d]+\]\s*/g, '').trim();
-
-            if (cleanedLabel === cleanedStepKey || label === cleanedStepKey) {
-              stepItem = item;
-              logToExtension(`Found fuzzy match: "${label}" matches "${stepKey}"`, 'INFO');
-              break;
+        // NEW APPROACH: Since Map now uses step ID (not text) as key,
+        // we need to find the step by matching the label text
+        // For duplicate step texts (e.g., same step in different lines),
+        // we need to match them sequentially based on execution order
+        
+        // Try to find step by exact label match
+        // For duplicate steps, we use the first unprocessed one (not yet marked passed/failed/skipped)
+        let foundSteps: Array<{id: string, item: vscode.TestItem}> = [];
+        
+        for (const [stepId, item] of stepItemsMap.entries()) {
+          // Check if label matches (exact match or fuzzy match)
+          const itemLabel = item.label;
+          
+          // Try exact match first
+          if (itemLabel === stepText) {
+            foundSteps.push({id: stepId, item});
+            continue;
+          }
+          
+          // Try fuzzy match (remove tags like [MKT05A06])
+          const cleanedItemLabel = itemLabel.replace(/\[[\w\d]+\]\s*/g, '').trim();
+          const cleanedStepText = stepText.replace(/\[[\w\d]+\]\s*/g, '').trim();
+          
+          if (cleanedItemLabel === cleanedStepText) {
+            foundSteps.push({id: stepId, item});
+          }
+        }
+        
+        if (foundSteps.length > 0) {
+          // For duplicate steps, use the first unprocessed one
+          let selectedStep = foundSteps[0];
+          
+          // If multiple matches, try to find the first unprocessed one
+          if (foundSteps.length > 1) {
+            for (const fs of foundSteps) {
+              if (!processedSteps.has(fs.id)) {
+                selectedStep = fs;
+                break;
+              }
             }
+          }
+          
+          stepItem = selectedStep.item;
+          logToExtension(`✅ Found step match: "${stepItem.label}"`, 'INFO');
+          logToExtension(`  Step ID: ${stepItem.id}`, 'INFO');
+          logToExtension(`  Total matches found: ${foundSteps.length}`, foundSteps.length > 1 ? 'WARN' : 'DEBUG');
+          
+          if (foundSteps.length > 1) {
+            logToExtension(`  ⚠️  Multiple steps with same text:`, 'WARN');
+            foundSteps.forEach((s, idx) => {
+              const processed = processedSteps.has(s.id) ? '✓ processed' : '⭘ pending';
+              const lineNum = s.id.split(':step:')[1];
+              logToExtension(`    [${idx}] Line ${lineNum}: ${s.item.label} (${processed})`, 'WARN');
+            });
+          }
+        } else {
+          logToExtension(`❌ No matching step found in stepItemsMap`, 'WARN');
+          logToExtension(`  Available steps (${stepItemsMap.size}):`, 'DEBUG');
+          let count = 0;
+          for (const [stepId, item] of stepItemsMap.entries()) {
+            const lineNum = stepId.split(':step:')[1];
+            logToExtension(`  [${count++}] Line ${lineNum}: "${item.label}"`, 'DEBUG');
+          }
+          
+          // This is likely a Background or Before hook step
+          // Create a dynamic step item in the Before container
+          if (beforeStepsContainer) {
+            logToExtension(`🔧 Detected Background/Before hook step: "${stepText}"`, 'INFO');
+            
+            // Check if we already created this background step
+            const backgroundStepKey = `${stepText}_${stepResult.status}`;
+            let backgroundStep = backgroundStepsMap.get(stepText);
+            
+            if (!backgroundStep) {
+              // Create new background step item
+              const backgroundStepId = `${beforeStepsContainer.id}:bg_step:${backgroundStepsMap.size}`;
+              backgroundStep = this.controller.createTestItem(
+                backgroundStepId,
+                stepText,
+                uri
+              );
+              
+              // Add to Before container
+              beforeStepsContainer.children.add(backgroundStep);
+              backgroundStepsMap.set(stepText, backgroundStep);
+              
+              // Mark as started
+              run.started(backgroundStep);
+              
+              logToExtension(`  ✨ Created new Background step: ${backgroundStepId}`, 'INFO');
+              logToExtension(`  📍 Added to Before container (total: ${backgroundStepsMap.size})`, 'INFO');
+            }
+            
+            // Use this background step as the stepItem to update
+            stepItem = backgroundStep;
           }
         }
 
         if (stepItem) {
-          logToExtension(`Updating step in Test Explorer: ${stepKey} - ${stepResult.status}`, 'INFO');
+          logToExtension(`Updating step status: ${stepText} - ${stepResult.status}`, 'INFO');
           logToExtension(`  Step ID: ${stepItem.id}`, 'DEBUG');
           logToExtension(`  Step label: ${stepItem.label}`, 'DEBUG');
 
-          // IMPORTANT: Mark step as started first, so Test Explorer shows it's running
-          run.started(stepItem);
-          logToExtension(`  TestRun.started() called for: ${stepItem.id}`, 'DEBUG');
-
+          // NOTE: run.started() was already called during pre-registration above
+          // We only need to update the terminal state (passed/failed/skipped)
+          // TestRun lifecycle: started() [DONE] → passed()/failed()/skipped() [NOW]
+          
+          // Mark this step as processed
+          processedSteps.add(stepItem.id);
+          
+          // Transition to terminal state based on step result
           switch (stepResult.status) {
             case 'passed':
               run.passed(stepItem);
-              logToExtension(`✅ Step PASSED in UI: ${stepKey}`, 'INFO');
+              logToExtension(`✅ Step PASSED: ${stepText}`, 'INFO');
               logToExtension(`  TestRun.passed() called for: ${stepItem.id}`, 'DEBUG');
               break;
-            case 'failed':
+            case 'failed': {
               hasFailedStep = true; // Mark that we have a failed step
               const errorMsg = stepResult.errorMessage || 'Step failed';
               run.failed(stepItem, new vscode.TestMessage(errorMsg));
-              logToExtension(`❌ Step FAILED in UI: ${stepKey}`, 'ERROR');
+              logToExtension(`❌ Step FAILED: ${stepText}`, 'ERROR');
+              logToExtension(`  Error message: ${errorMsg}`, 'ERROR');
               logToExtension(`  TestRun.failed() called for: ${stepItem.id}`, 'DEBUG');
 
               // Immediately mark the scenario as failed if it's a scenario test
               if (testItem.id.includes(':scenario:')) {
-                logToExtension(`Marking scenario as FAILED due to step failure: ${stepKey}`, 'ERROR');
-                run.failed(testItem, new vscode.TestMessage(`Step failed: ${stepKey}\n${errorMsg}`));
+                logToExtension(`Marking scenario as FAILED due to step failure: ${stepText}`, 'ERROR');
+                run.failed(testItem, new vscode.TestMessage(`Step failed: ${stepText}\n${errorMsg}`));
                 logToExtension(`  TestRun.failed() called for scenario: ${testItem.id}`, 'DEBUG');
               }
               break;
+            }
             case 'skipped':
               run.skipped(stepItem);
-              logToExtension(`⊝ Step SKIPPED in UI: ${stepKey}`, 'WARN');
+              logToExtension(`⊝ Step SKIPPED: ${stepText}`, 'WARN');
               logToExtension(`  TestRun.skipped() called for: ${stepItem.id}`, 'DEBUG');
               break;
           }
         } else {
-          logToExtension(`⚠️ Step not found in Test Explorer after fuzzy match: ${stepKey}`, 'WARN');
-          logToExtension(`Available steps: ${Array.from(stepItemsMap.keys()).join(', ')}`, 'DEBUG');
+          logToExtension(`⚠️ Step not found in Test Explorer: ${stepText}`, 'WARN');
+          logToExtension(`  This step is likely from Background or Before hooks`, 'INFO');
         }
       };
 
@@ -663,6 +834,8 @@ class CucumberTestController {
 
         // Mark scenario as passed if no steps failed, regardless of exit code
         // (exit code may be non-zero due to other tests failing in multi-module projects)
+        // TestRun lifecycle: We determine final state based on step failures, not exit code
+        // Scenario was already marked as started at the beginning of runSingleTest()
         if (!hasFailedStep) {
           run.passed(testItem);
           logToExtension(`Scenario PASSED (no failed steps, exit code ${exitCode})`, 'INFO');
@@ -681,6 +854,7 @@ class CucumberTestController {
 
         // Mark feature as passed if no steps failed, regardless of exit code
         // (exit code may be non-zero due to other tests failing in multi-module projects)
+        // TestRun lifecycle: Feature state determined by child step failures
         if (!hasFailedStep) {
           run.passed(testItem);
           logToExtension(`Feature PASSED (no failed steps, exit code ${exitCode})`, 'INFO');
@@ -868,7 +1042,7 @@ const TEST_CLASS_CACHE_KEY = 'cucumberTestClassMapping';
  * Logs a message to the extension log channel
  */
 function logToExtension(message: string, level: 'INFO' | 'WARN' | 'ERROR' | 'DEBUG' = 'INFO'): void {
-  if (!extensionLogChannel) return;
+  if (!extensionLogChannel) {return;}
 
   const timestamp = new Date().toLocaleTimeString();
   const prefix = `[${timestamp}] [${level}]`;
@@ -930,7 +1104,7 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   // Command to run the entire feature file
-  let runFeatureCommand = vscode.commands.registerCommand('cucumberJavaEasyRunner.runFeature', async (uri: vscode.Uri) => {
+  const runFeatureCommand = vscode.commands.registerCommand('cucumberJavaEasyRunner.runFeature', async (uri: vscode.Uri) => {
     let featureUri = uri;
     
     // If called from editor instead of explorer
@@ -947,28 +1121,28 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   // CodeLens command to run the entire feature file
-  let runFeatureCodeLensCommand = vscode.commands.registerCommand('cucumberJavaEasyRunner.runFeatureCodeLens', async (uri: vscode.Uri) => {
+  const runFeatureCodeLensCommand = vscode.commands.registerCommand('cucumberJavaEasyRunner.runFeatureCodeLens', async (uri: vscode.Uri) => {
     console.log('runFeatureCodeLensCommand called with URI:', uri.toString());
     vscode.window.showInformationMessage('Feature test starting...');
     runSelectedTest(uri);
   });
 
   // CodeLens command to run a single scenario
-  let runScenarioCodeLensCommand = vscode.commands.registerCommand('cucumberJavaEasyRunner.runScenarioCodeLens', async (uri: vscode.Uri, lineNumber: number) => {
+  const runScenarioCodeLensCommand = vscode.commands.registerCommand('cucumberJavaEasyRunner.runScenarioCodeLens', async (uri: vscode.Uri, lineNumber: number) => {
     console.log('runScenarioCodeLensCommand called with URI:', uri.toString(), 'line:', lineNumber);
     vscode.window.showInformationMessage(`Scenario test starting at line ${lineNumber}...`);
     runSelectedTest(uri, lineNumber);
   });
 
   // CodeLens command to run a single example
-  let runExampleCodeLensCommand = vscode.commands.registerCommand('cucumberJavaEasyRunner.runExampleCodeLens', async (uri: vscode.Uri, scenarioLine: number, exampleLine: number) => {
+  const runExampleCodeLensCommand = vscode.commands.registerCommand('cucumberJavaEasyRunner.runExampleCodeLens', async (uri: vscode.Uri, scenarioLine: number, exampleLine: number) => {
     console.log('runExampleCodeLensCommand called with URI:', uri.toString(), 'scenario line:', scenarioLine, 'example line:', exampleLine);
     vscode.window.showInformationMessage(`Example test starting at line ${exampleLine}...`);
     runSelectedTest(uri, scenarioLine, exampleLine);
   });
 
   // Command to run a single scenario
-  let runScenarioCommand = vscode.commands.registerCommand('cucumberJavaEasyRunner.runScenario', async () => {
+  const runScenarioCommand = vscode.commands.registerCommand('cucumberJavaEasyRunner.runScenario', async () => {
     const editor = vscode.window.activeTextEditor;
     if (!editor) {
       vscode.window.showErrorMessage('Please open a feature file.');
@@ -993,7 +1167,7 @@ export function activate(context: vscode.ExtensionContext) {
   });
   
   // Command to run a single example row
-  let runExampleCommand = vscode.commands.registerCommand('cucumberJavaEasyRunner.runExample', async () => {
+  const runExampleCommand = vscode.commands.registerCommand('cucumberJavaEasyRunner.runExample', async () => {
     const editor = vscode.window.activeTextEditor;
     if (!editor) {
       vscode.window.showErrorMessage('Please open a feature file.');
@@ -1027,7 +1201,7 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   // Command to toggle execution mode
-  let toggleExecutionModeCommand = vscode.commands.registerCommand('cucumberJavaEasyRunner.toggleExecutionMode', async () => {
+  const toggleExecutionModeCommand = vscode.commands.registerCommand('cucumberJavaEasyRunner.toggleExecutionMode', async () => {
     const config = vscode.workspace.getConfiguration('cucumberJavaEasyRunner');
     const currentMode = config.get<string>('executionMode', 'java');
     const newMode = currentMode === 'java' ? 'maven' : 'java';
@@ -1039,7 +1213,7 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   // Command to clear test class cache
-  let clearTestClassCacheCommand = vscode.commands.registerCommand('cucumberJavaEasyRunner.clearTestClassCache', async () => {
+  const clearTestClassCacheCommand = vscode.commands.registerCommand('cucumberJavaEasyRunner.clearTestClassCache', async () => {
     await context.workspaceState.update(TEST_CLASS_CACHE_KEY, {});
     vscode.window.showInformationMessage('Test class cache cleared successfully!');
   });
@@ -1344,7 +1518,7 @@ function findScenarioAtLine(document: vscode.TextDocument, line: number): Scenar
   for (let i = line; i >= 0; i--) {
     const currentLine = lines[i].trim();
     if (currentLine.startsWith('Scenario:') || currentLine.startsWith('Scenario Outline:')) {
-      let name = currentLine.substring(currentLine.indexOf(':') + 1).trim();
+      const name = currentLine.substring(currentLine.indexOf(':') + 1).trim();
       return { name, lineNumber: i + 1 }; // 1-indexed line number for Cucumber
     }
   }
@@ -1731,8 +1905,8 @@ public class CucumberRunner {
   const mvnArgs = ['-q', '-DincludeScope=test', '-DskipTests', 'dependency:build-classpath', `-Dmdep.outputFile=${cpFile}`];
   const mvnRes = await execFilePromise('mvn', mvnArgs, projectRoot);
   if (onOutput) {
-    if (mvnRes.stdout) onOutput(mvnRes.stdout);
-    if (mvnRes.stderr) onOutput(mvnRes.stderr);
+    if (mvnRes.stdout) {onOutput(mvnRes.stdout);}
+    if (mvnRes.stderr) {onOutput(mvnRes.stderr);}
   }
   if (mvnRes.code !== 0) {
     return mvnRes.code;
@@ -1750,8 +1924,8 @@ public class CucumberRunner {
   const javacArgs = ['-cp', fullClasspath, '-d', tmpDir, javaFilePath];
   const javacRes = await execFilePromise('javac', javacArgs, projectRoot);
   if (onOutput) {
-    if (javacRes.stdout) onOutput(javacRes.stdout);
-    if (javacRes.stderr) onOutput(javacRes.stderr);
+    if (javacRes.stdout) {onOutput(javacRes.stdout);}
+    if (javacRes.stderr) {onOutput(javacRes.stderr);}
   }
   if (javacRes.code !== 0) {
     return javacRes.code;
@@ -1762,10 +1936,10 @@ public class CucumberRunner {
   const child = spawn('java', ['-cp', runCp, 'CucumberRunner'], { cwd: projectRoot });
   return await new Promise<number>((resolve) => {
     child.stdout?.on('data', (chunk: Buffer) => {
-      if (onOutput) onOutput(chunk.toString());
+      if (onOutput) {onOutput(chunk.toString());}
     });
     child.stderr?.on('data', (chunk: Buffer) => {
-      if (onOutput) onOutput(chunk.toString());
+      if (onOutput) {onOutput(chunk.toString());}
     });
     child.on('close', (code) => {
       resolve(typeof code === 'number' ? code : 1);
@@ -1970,7 +2144,7 @@ async function runCucumberTestWithMavenResult(
   const child = spawn('sh', ['-c', filteredCommand], { cwd: workspaceRoot, env: spawnEnv });
   logToExtension(`Maven process started with output filtering in: ${workspaceRoot}`, 'INFO');
 
-  let testSummary = {
+  const testSummary = {
     scenarios: 0,
     steps: 0,
     failures: 0,
@@ -1978,29 +2152,42 @@ async function runCucumberTestWithMavenResult(
     passed: 0
   };
 
-  // Line buffer to handle incomplete lines from stdout chunks
-  let lineBuffer = '';
+  // Collect all output for batch processing at the end
+  let fullOutput = '';
 
   return await new Promise<number>((resolve) => {
     child.stdout?.on('data', (chunk: Buffer) => {
       const output = chunk.toString();
+      
+      // Collect output for batch processing
+      fullOutput += output;
+      
+      if (onOutput) {onOutput(output);}
+    });
 
-      // Parse output for step results
-      if (parser) {
-        // Append chunk to line buffer
-        lineBuffer += output;
+    child.stderr?.on('data', (chunk: Buffer) => {
+      const errorOutput = chunk.toString();
+      logToExtension(`Maven stderr: ${errorOutput.substring(0, 200)}`, 'WARN');
+      if (onOutput) {onOutput(errorOutput);}
+    });
 
-        // Split by newlines and keep the last incomplete part in buffer
-        const lines = lineBuffer.split('\n');
+    child.on('close', (code) => {
+      const exitCode = typeof code === 'number' ? code : 1;
+      logToExtension(`Maven process exited with code: ${exitCode}`, 'INFO');
 
-        // Keep the last element (incomplete line) in the buffer
-        lineBuffer = lines.pop() || '';
-
-        // Process all lines (already filtered by grep at Maven execution stage)
+      // Batch process all output after Maven completes
+      if (parser && fullOutput.trim()) {
+        logToExtension('Starting batch parsing of Maven output...', 'INFO');
+        
+        const lines = fullOutput.split('\n');
+        let stepsProcessed = 0;
+        
         for (const line of lines) {
-          // Parse line for step status
-          parser.parseLine(line);
-
+          const result = parser.parseLine(line);
+          if (result) {
+            stepsProcessed++;
+          }
+          
           // Parse test summary - Pattern: "5 Scenarios (2 failed, 3 passed)"
           const scenarioMatch = line.match(/(\d+)\s+Scenarios?\s+\(([^)]+)\)/i);
           if (scenarioMatch) {
@@ -2011,9 +2198,9 @@ async function runCucumberTestWithMavenResult(
             const passedMatch = details.match(/(\d+)\s+passed/);
             const skippedMatch = details.match(/(\d+)\s+skipped/);
 
-            if (failedMatch) testSummary.failures = parseInt(failedMatch[1]);
-            if (passedMatch) testSummary.passed = parseInt(passedMatch[1]);
-            if (skippedMatch) testSummary.skipped = parseInt(skippedMatch[1]);
+            if (failedMatch) {testSummary.failures = parseInt(failedMatch[1]);}
+            if (passedMatch) {testSummary.passed = parseInt(passedMatch[1]);}
+            if (skippedMatch) {testSummary.skipped = parseInt(skippedMatch[1]);}
 
             logToExtension(`Parsed scenario summary: ${testSummary.scenarios} total, ${testSummary.failures} failed, ${testSummary.passed} passed`, 'INFO');
           }
@@ -2027,38 +2214,16 @@ async function runCucumberTestWithMavenResult(
             const failedMatch = details.match(/(\d+)\s+failed/);
             const skippedMatch = details.match(/(\d+)\s+skipped/);
 
-            if (failedMatch) testSummary.failures = parseInt(failedMatch[1]);
-            if (skippedMatch) testSummary.skipped = parseInt(skippedMatch[1]);
+            if (failedMatch) {testSummary.failures = parseInt(failedMatch[1]);}
+            if (skippedMatch) {testSummary.skipped = parseInt(skippedMatch[1]);}
 
             logToExtension(`Parsed steps summary: ${testSummary.steps} total, ${testSummary.failures} failed, ${testSummary.skipped} skipped`, 'INFO');
           }
         }
-      }
-
-      if (onOutput) onOutput(output);
-    });
-
-    child.stderr?.on('data', (chunk: Buffer) => {
-      const errorOutput = chunk.toString();
-      logToExtension(`Maven stderr: ${errorOutput.substring(0, 200)}`, 'WARN');
-      if (onOutput) onOutput(errorOutput);
-    });
-
-    child.on('close', (code) => {
-      const exitCode = typeof code === 'number' ? code : 1;
-      logToExtension(`Maven process exited with code: ${exitCode}`, 'INFO');
-
-      // Parse any remaining content in the line buffer
-      if (parser && lineBuffer.trim()) {
-        logToExtension(`Processing remaining buffered line: "${lineBuffer}"`, 'DEBUG');
-        parser.parseLine(lineBuffer);
-        lineBuffer = '';
-      }
-
-      // Finalize parser to display any pending steps
-      if (parser) {
+        
+        // Finalize parser after processing all lines
         parser.finalize();
-        logToExtension('Parser finalized (output already filtered by grep at Maven stage)', 'DEBUG');
+        logToExtension(`Batch parsing completed. Processed ${stepsProcessed} steps.`, 'INFO');
       }
 
       // Determine test result based on failures count and exit code
@@ -2100,4 +2265,6 @@ async function runCucumberTestWithMavenResult(
   });
 }
 
+// Deactivate function - called when extension is deactivated
+// eslint-disable-next-line @typescript-eslint/no-empty-function
 export function deactivate() {} 
