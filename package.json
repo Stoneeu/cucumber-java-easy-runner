@@ -2,7 +2,7 @@
   "name": "cucumber-java-easy-runner",
   "displayName": "Cucumber Java Easy Runner",
   "description": "VS Code extension for easily running Cucumber Feature files in Java projects",
-  "version": "0.0.9",
+  "version": "0.1.0",
   "publisher": "HakkiEtem",
   "author": {
     "name": "Hakki Etem"
@@ -58,7 +58,7 @@
         "command": "cucumberJavaEasyRunner.runScenarioCodeLens",
         "title": "▶ Run Scenario"
       },
-            {
+      {
         "command": "cucumberJavaEasyRunner.runExampleCodeLens",
         "title": "▶ Run Example"
       },
@@ -66,6 +66,14 @@
         "command": "cucumberJavaEasyRunner.refreshTests",
         "title": "Refresh Cucumber Tests",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "cucumberJavaEasyRunner.toggleExecutionMode",
+        "title": "Cucumber: Toggle Execution Mode (Java ⇄ Maven)"
+      },
+      {
+        "command": "cucumberJavaEasyRunner.clearTestClassCache",
+        "title": "Cucumber: Clear Test Class Cache"
       }
     ],
     "menus": {
@@ -100,15 +108,18 @@
         }
       ]
     },
-
     "languages": [
       {
         "id": "gherkin",
-        "extensions": [".feature"],
-        "aliases": ["Gherkin", "feature"]
+        "extensions": [
+          ".feature"
+        ],
+        "aliases": [
+          "Gherkin",
+          "feature"
+        ]
       }
     ],
-
     "configuration": {
       "title": "Cucumber Java Easy Runner",
       "properties": {
@@ -116,6 +127,55 @@
           "type": "boolean",
           "default": false,
           "description": "Enable CodeLens buttons in feature files. When disabled, use Test Explorer instead for a cleaner interface."
+        },
+        "cucumberJavaEasyRunner.executionMode": {
+          "type": "string",
+          "enum": [
+            "java",
+            "maven"
+          ],
+          "default": "java",
+          "description": "Execution mode: 'java' for direct Java execution, 'maven' for Maven test execution (supports multi-module projects)"
+        },
+        "cucumberJavaEasyRunner.testClassName": {
+          "type": "string",
+          "default": "",
+          "description": "Test class name for Maven execution mode (e.g., MktSegmentCriteriaUpdateTest). Leave empty for auto-detection."
+        },
+        "cucumberJavaEasyRunner.mavenArgs": {
+          "type": "string",
+          "default": "",
+          "description": "Additional Maven arguments (e.g., '-X' for debug, '-e' for errors)"
+        },
+        "cucumberJavaEasyRunner.mavenProfile": {
+          "type": "string",
+          "default": "",
+          "description": "Maven profile to activate (e.g., 'dev', 'test'). Leave empty to use default profile."
+        },
+        "cucumberJavaEasyRunner.customGluePath": {
+          "type": "string",
+          "default": "",
+          "description": "Custom glue path (e.g., 'com.example.steps'). Leave empty for auto-detection."
+        },
+        "cucumberJavaEasyRunner.environmentVariables": {
+          "type": "object",
+          "default": {},
+          "description": "Environment variables to set when running tests (e.g., {\"ENV\": \"test\", \"DB_URL\": \"localhost\"})"
+        },
+        "cucumberJavaEasyRunner.rememberTestClass": {
+          "type": "boolean",
+          "default": true,
+          "description": "Remember the test class used for each feature file to avoid re-entering it"
+        },
+        "cucumberJavaEasyRunner.showStepResults": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show real-time step execution results during test runs"
+        },
+        "cucumberJavaEasyRunner.cucumberTags": {
+          "type": "string",
+          "default": "",
+          "description": "Cucumber tags filter (e.g., '@smoke and not @slow'). Leave empty to run all scenarios."
         }
       }
     }
@@ -129,14 +189,16 @@
     "test": "node ./out/test/runTest.js"
   },
   "devDependencies": {
-    "@types/vscode": "^1.93.1",
     "@types/glob": "^8.1.0",
     "@types/mocha": "^10.0.1",
     "@types/node": "16.x",
-    "typescript": "^5.0.4",
+    "@types/vscode": "^1.93.1",
+    "@typescript-eslint/eslint-plugin": "^5.62.0",
+    "@typescript-eslint/parser": "^5.62.0",
+    "@vscode/test-electron": "^2.5.2",
     "eslint": "^8.39.0",
     "glob": "^8.1.0",
-    "@typescript-eslint/eslint-plugin": "^5.59.1",
-    "@typescript-eslint/parser": "^5.59.1"
+    "mocha": "^10.8.2",
+    "typescript": "^5.0.4"
   }
 }
