@@ -2,7 +2,7 @@
   "name": "cucumber-java-easy-runner",
   "displayName": "Cucumber Java Easy Runner",
   "description": "VS Code extension for easily running Cucumber Feature files in Java projects",
-  "version": "0.0.9",
+  "version": "0.1.0",
   "publisher": "HakkiEtem",
   "author": {
     "name": "Hakki Etem"
@@ -58,7 +58,7 @@
         "command": "cucumberJavaEasyRunner.runScenarioCodeLens",
         "title": "▶ Run Scenario"
       },
-            {
+      {
         "command": "cucumberJavaEasyRunner.runExampleCodeLens",
         "title": "▶ Run Example"
       },
@@ -108,15 +108,18 @@
         }
       ]
     },
-
     "languages": [
       {
         "id": "gherkin",
-        "extensions": [".feature"],
-        "aliases": ["Gherkin", "feature"]
+        "extensions": [
+          ".feature"
+        ],
+        "aliases": [
+          "Gherkin",
+          "feature"
+        ]
       }
     ],
-
     "configuration": {
       "title": "Cucumber Java Easy Runner",
       "properties": {
@@ -127,7 +130,10 @@
         },
         "cucumberJavaEasyRunner.executionMode": {
           "type": "string",
-          "enum": ["java", "maven"],
+          "enum": [
+            "java",
+            "maven"
+          ],
           "default": "java",
           "description": "Execution mode: 'java' for direct Java execution, 'maven' for Maven test execution (supports multi-module projects)"
         },
@@ -183,14 +189,16 @@
     "test": "node ./out/test/runTest.js"
   },
   "devDependencies": {
-    "@types/vscode": "^1.93.1",
     "@types/glob": "^8.1.0",
     "@types/mocha": "^10.0.1",
     "@types/node": "16.x",
-    "typescript": "^5.0.4",
+    "@types/vscode": "^1.93.1",
+    "@typescript-eslint/eslint-plugin": "^5.62.0",
+    "@typescript-eslint/parser": "^5.62.0",
+    "@vscode/test-electron": "^2.5.2",
     "eslint": "^8.39.0",
     "glob": "^8.1.0",
-    "@typescript-eslint/eslint-plugin": "^5.59.1",
-    "@typescript-eslint/parser": "^5.59.1"
+    "mocha": "^10.8.2",
+    "typescript": "^5.0.4"
   }
 }
