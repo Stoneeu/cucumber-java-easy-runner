@@ -34,6 +34,9 @@ logs/
 # Test coverage reports
 coverage/
 
+# Test infrastructure (contains sensitive data)
+src/test/
+
 # Temporary files
 tmp/
 temp/ 
