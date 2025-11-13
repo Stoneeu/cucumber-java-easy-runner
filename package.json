@@ -1,8 +1,8 @@
 {
   "name": "cucumber-java-easy-runner",
   "displayName": "Cucumber Java Easy Runner",
-  "description": "VS Code extension for easily running Cucumber Feature files in Java projects",
-  "version": "0.1.0",
+  "description": "VS Code extension for easily running Cucumber Feature files in Java projects - v23.37: Auto-compile configurable (default: off)",
+  "version": "0.23.37",
   "publisher": "HakkiEtem",
   "author": {
     "name": "Hakki Etem"
@@ -172,10 +172,54 @@
           "default": true,
           "description": "Show real-time step execution results during test runs"
         },
+        "cucumberJavaEasyRunner.autoCompileBeforeTest": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically compile project before running tests (mvn compile test-compile). Default: false (user compiles manually for better performance)"
+        },
         "cucumberJavaEasyRunner.cucumberTags": {
           "type": "string",
           "default": "",
           "description": "Cucumber tags filter (e.g., '@smoke and not @slow'). Leave empty to run all scenarios."
+        },
+        "cucumberJavaEasyRunner.debug.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable debug support for Cucumber tests"
+        },
+        "cucumberJavaEasyRunner.debug.port": {
+          "type": "number",
+          "default": 5005,
+          "minimum": 1024,
+          "maximum": 65535,
+          "description": "Default debug port (will auto-increment if occupied)"
+        },
+        "cucumberJavaEasyRunner.debug.timeout": {
+          "type": "number",
+          "default": 30000,
+          "description": "Timeout for debugger attach in milliseconds"
+        },
+        "cucumberJavaEasyRunner.debug.suspend": {
+          "type": "boolean",
+          "default": true,
+          "description": "Suspend execution until debugger is attached (suspend=y)"
+        },
+        "cucumberJavaEasyRunner.debug.requestMode": {
+          "type": "string",
+          "enum": ["launch", "attach"],
+          "default": "attach",
+          "description": "Debug request mode: 'attach' (recommended, v16 enhanced) or 'launch' (experimental, may not work with complex projects)"
+        },
+        "cucumberJavaEasyRunner.debug.sourcePaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "src/test/java",
+            "src/main/java"
+          ],
+          "description": "Source code paths for debugging (relative to workspace root)"
         }
       }
     }

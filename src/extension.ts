@@ -4,6 +4,25 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { execFile } from 'child_process';
 import { spawn } from 'child_process';
+import * as glob from 'glob';
+import {
+  DebugPortManager,
+  createDebugConfiguration,
+  createLaunchDebugConfiguration,
+  createCucumberLaunchConfig,
+  waitForDebugServerWithProgress,
+  startDebugSession,
+  startLaunchDebugSession,
+  buildJdwpArgsForMaven,
+  handleDebugError,
+  extractMavenArtifactId
+} from './debug-integration';
+import {
+  resolveMavenClasspath,
+  extractGluePackage,
+  buildCucumberArgs,
+  isValidMavenProject
+} from './maven-utils';
 
 interface StepInfo {
   keyword: string;  // Given, When, Then, And, But
@@ -48,6 +67,22 @@ export interface StepResult {
 interface TestClassMapping {
   [featurePath: string]: string;
 }
+
+/**
+ * v23.2: Tag cache for performance optimization
+ * Caches extracted tags to avoid re-parsing files
+ */
+interface TagCacheEntry {
+  tags: string[];
+  mtime: number; // File modification time in milliseconds
+}
+
+interface TagCache {
+  [filePath: string]: TagCacheEntry;
+}
+
+// Global tag cache
+const tagCache: TagCache = {};
 
 /**
  * Cucumber output parser for real-time step results
@@ -299,12 +334,20 @@ class CucumberTestController {
     watcher.onDidChange(uri => this.handleFileEvent('change', uri));
     watcher.onDidDelete(uri => this.handleFileEvent('delete', uri));
 
-    // Set up test run handler
+    // Set up test run handler for normal execution
     this.controller.createRunProfile(
       'Run Cucumber Tests',
       vscode.TestRunProfileKind.Run,
-      (request, token) => this.runTests(request, token),
-      true
+      (request, token) => this.runTests(request, token, false),
+      true  // isDefault
+    );
+
+    // Set up debug profile for debugging
+    this.controller.createRunProfile(
+      'Debug Cucumber Tests',
+      vscode.TestRunProfileKind.Debug,
+      (request, token) => this.runTests(request, token, true),
+      false  // not default
     );
 
     // Add refresh button to test controller
@@ -534,17 +577,24 @@ class CucumberTestController {
     };
   }
 
-  private async runTests(request: vscode.TestRunRequest, token: vscode.CancellationToken) {
+  private async runTests(request: vscode.TestRunRequest, token: vscode.CancellationToken, isDebug: boolean = false) {
     const run = this.controller.createTestRun(request);
     
     const testItems = request.include || this.gatherAllTests();
+    
+    // Log execution mode
+    if (isDebug) {
+      logToExtension('Starting tests in DEBUG mode', 'INFO');
+    } else {
+      logToExtension('Starting tests in RUN mode', 'INFO');
+    }
     
     for (const testItem of testItems) {
       if (token.isCancellationRequested) {
         break;
       }
 
-      await this.runSingleTest(testItem, run);
+      await this.runSingleTest(testItem, run, isDebug);
     }
 
     run.end();
@@ -561,13 +611,19 @@ class CucumberTestController {
     return tests;
   }
 
-  private async runSingleTest(testItem: vscode.TestItem, run: vscode.TestRun) {
+  private async runSingleTest(testItem: vscode.TestItem, run: vscode.TestRun, isDebug: boolean = false) {
     // TestRun lifecycle: started() → running → passed()/failed()/skipped() → end()
     // Mark test item as started to show "preparing" state in Test Explorer
     run.started(testItem);
 
     try {
       const uri = testItem.uri!;
+      
+      // Log test execution mode
+      logToExtension(
+        `Running test "${testItem.label}" in ${isDebug ? 'DEBUG' : 'RUN'} mode`,
+        'INFO'
+      );
 
       // Create a map to track step test items by their text for real-time updates
       const stepItemsMap = new Map<string, vscode.TestItem>();
@@ -806,13 +862,28 @@ class CucumberTestController {
         const scenarioLine = parseInt(parts[2]); // scenario line number
         const exampleLine = parseInt(parts[4]); // example line number
         logToExtension(`Running example at scenario line ${scenarioLine}, example line ${exampleLine}`, 'INFO');
-        const exitCode = await runSelectedTestAndWait(
-          uri,
-          scenarioLine,
-          exampleLine,
-          (data) => run.appendOutput(data, undefined, testItem),
-          onStepUpdate
-        );
+        
+        let exitCode: number;
+        if (isDebug) {
+          // Debug mode execution
+          exitCode = await runSelectedTestInDebugMode(
+            uri,
+            testItem,
+            run,
+            scenarioLine,
+            exampleLine,
+            onStepUpdate
+          );
+        } else {
+          // Normal mode execution
+          exitCode = await runSelectedTestAndWait(
+            uri,
+            scenarioLine,
+            exampleLine,
+            (data) => run.appendOutput(data, undefined, testItem),
+            onStepUpdate
+          );
+        }
         // Mark example as passed if no steps failed, regardless of exit code
         if (!hasFailedStep) {
           run.passed(testItem);
@@ -824,13 +895,28 @@ class CucumberTestController {
         const parts = testItem.id.split(':scenario:');
         const lineNumber = parseInt(parts[1].split(':')[0]); // Get first part before any additional colons
         logToExtension(`Running scenario at line ${lineNumber}`, 'INFO');
-        const exitCode = await runSelectedTestAndWait(
-          uri,
-          lineNumber,
-          undefined,
-          (data) => run.appendOutput(data, undefined, testItem),
-          onStepUpdate
-        );
+        
+        let exitCode: number;
+        if (isDebug) {
+          // Debug mode execution
+          exitCode = await runSelectedTestInDebugMode(
+            uri,
+            testItem,
+            run,
+            lineNumber,
+            undefined,
+            onStepUpdate
+          );
+        } else {
+          // Normal mode execution
+          exitCode = await runSelectedTestAndWait(
+            uri,
+            lineNumber,
+            undefined,
+            (data) => run.appendOutput(data, undefined, testItem),
+            onStepUpdate
+          );
+        }
 
         // Mark scenario as passed if no steps failed, regardless of exit code
         // (exit code may be non-zero due to other tests failing in multi-module projects)
@@ -844,13 +930,28 @@ class CucumberTestController {
       } else {
         // This is a feature file
         logToExtension(`Running entire feature file`, 'INFO');
-        const exitCode = await runSelectedTestAndWait(
-          uri,
-          undefined,
-          undefined,
-          (data) => run.appendOutput(data, undefined, testItem),
-          onStepUpdate
-        );
+        
+        let exitCode: number;
+        if (isDebug) {
+          // Debug mode execution
+          exitCode = await runSelectedTestInDebugMode(
+            uri,
+            testItem,
+            run,
+            undefined,
+            undefined,
+            onStepUpdate
+          );
+        } else {
+          // Normal mode execution
+          exitCode = await runSelectedTestAndWait(
+            uri,
+            undefined,
+            undefined,
+            (data) => run.appendOutput(data, undefined, testItem),
+            onStepUpdate
+          );
+        }
 
         // Mark feature as passed if no steps failed, regardless of exit code
         // (exit code may be non-zero due to other tests failing in multi-module projects)
@@ -1508,6 +1609,488 @@ async function runSelectedTestAndWait(
 }
 
 /**
+ * Runs the selected test in DEBUG mode with debugger attachment
+ */
+async function runSelectedTestInDebugMode(
+  uri: vscode.Uri,
+  testItem: vscode.TestItem,
+  run: vscode.TestRun,
+  lineNumber?: number,
+  exampleLine?: number,
+  onStepUpdate?: (step: StepResult) => void
+): Promise<number> {
+  // ⭐ v23: Use Launch Mode instead of Attach Mode
+  // This bypasses all Maven/Surefire/JaCoCo issues from v16-v22
+  logToExtension('=== v23 DEBUG MODE: Launch Mode (Direct Cucumber CLI) ===', 'INFO');
+  
+  const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
+  if (!workspaceFolder) {
+    vscode.window.showErrorMessage('Feature file is not inside a workspace.');
+    return 1;
+  }
+
+  const workspaceRoot = workspaceFolder.uri.fsPath;
+  const config = vscode.workspace.getConfiguration('cucumberJavaEasyRunner');
+
+  // 1. Check breakpoints
+  const allBreakpoints = vscode.debug.breakpoints;
+  logToExtension(`Total breakpoints in workspace: ${allBreakpoints.length}`, 'INFO');
+  
+  if (allBreakpoints.length > 0) {
+    logToExtension('Breakpoints details:', 'DEBUG');
+    allBreakpoints.forEach((bp, index) => {
+      if (bp instanceof vscode.SourceBreakpoint) {
+        logToExtension(`  [${index}] ${bp.location.uri.fsPath}:${bp.location.range.start.line + 1} - Enabled: ${bp.enabled}`, 'DEBUG');
+      }
+    });
+  } else {
+    logToExtension('⚠️ WARNING: No breakpoints detected in workspace!', 'WARN');
+    vscode.window.showWarningMessage('No breakpoints set. Set breakpoints in your step definitions before debugging.');
+  }
+
+  try {
+    // 2. Find Maven module and test class
+    const moduleInfo = findMavenModule(uri.fsPath, workspaceRoot);
+    const relativePath = path.relative(workspaceRoot, uri.fsPath);
+
+    const configuredTestClass = config.get<string>('testClassName', '');
+    let testClassName: string = configuredTestClass;
+
+    if (!testClassName) {
+      // ⭐ v23: Try smart detection from feature file first
+      const smartDetected = await findCucumberTestClassFromFeature(moduleInfo.modulePath, uri.fsPath);
+      
+      if (smartDetected) {
+        testClassName = smartDetected;
+        logToExtension(`⭐ v23: Smart detection selected test class: ${testClassName}`, 'INFO');
+      } else {
+        // Fallback to old method
+        const autoDetectedClass = await findCucumberTestClass(moduleInfo.modulePath);
+        if (!autoDetectedClass) {
+          const userInput = await vscode.window.showInputBox({
+            prompt: 'Enter test class name (e.g., MktSegmentCriteriaUpdateTest)',
+            placeHolder: 'MktSegmentCriteriaUpdateTest'
+          });
+
+          if (!userInput) {
+            vscode.window.showErrorMessage('Test class name not specified, operation cancelled.');
+            return 1;
+          }
+          testClassName = userInput;
+        } else {
+          testClassName = autoDetectedClass;
+        }
+      }
+    }
+
+    // 3. Find test class file path (for glue package extraction)
+    const testClassPath = await findTestClassPath(moduleInfo.modulePath, testClassName);
+    if (!testClassPath) {
+      logToExtension(`⚠️ Could not find test class file: ${testClassName}`, 'WARN');
+      vscode.window.showErrorMessage(`Test class not found: ${testClassName}`);
+      return 1;
+    }
+
+    logToExtension(`Test class path: ${testClassPath}`, 'DEBUG');
+
+    // 4. Auto-detect source paths for multi-module projects
+    const sourcePaths: string[] = [];
+    if (moduleInfo.moduleRelativePath !== '.') {
+      const modulePrefix = moduleInfo.moduleRelativePath.replace(/\\/g, '/');
+      sourcePaths.push(
+        `${modulePrefix}/src/test/java`,
+        `${modulePrefix}/src/main/java`
+      );
+    } else {
+      sourcePaths.push(
+        'src/test/java',
+        'src/main/java',
+        '*/src/test/java',
+        '*/src/main/java'
+      );
+    }
+
+    // 5. Extract Maven artifactId as project name
+    let projectName: string | undefined;
+    const pomPath = path.join(moduleInfo.modulePath, 'pom.xml');
+    if (fs.existsSync(pomPath)) {
+      const artifactId = await extractMavenArtifactId(pomPath);
+      if (artifactId) {
+        projectName = artifactId;
+        logToExtension(`Maven artifactId: ${projectName}`, 'DEBUG');
+      }
+    }
+
+    if (!projectName) {
+      projectName = path.basename(moduleInfo.modulePath);
+    }
+
+    // 6. Execute using v23 Launch Mode
+    logToExtension('⭐ v23: Executing test using Launch Mode...', 'INFO');
+    
+    const exitCode = await runCucumberTestV23LaunchMode(
+      workspaceRoot,
+      workspaceFolder,
+      moduleInfo,
+      relativePath,
+      testClassPath,
+      true, // isDebug = true
+      lineNumber,
+      projectName,
+      sourcePaths,
+      (data) => run.appendOutput(data, undefined, testItem)
+    );
+
+    logToExtension(`v23 Launch Mode completed with exit code: ${exitCode}`, 'INFO');
+    return exitCode;
+
+  } catch (error: any) {
+    logToExtension(`v23 Debug mode error: ${error.message}`, 'ERROR');
+    
+    const shouldContinue = await handleDebugError(error);
+    if (shouldContinue) {
+      logToExtension('Falling back to normal run mode', 'WARN');
+      return await runSelectedTestAndWait(
+        uri,
+        lineNumber,
+        exampleLine,
+        (data) => run.appendOutput(data, undefined, testItem),
+        onStepUpdate
+      );
+    }
+
+    return 1;
+  }
+}
+
+/**
+ * v16-v22: OLD Attach Mode implementation (DEPRECATED)
+ * Kept for reference, but no longer used
+ * 
+ * @deprecated Use runSelectedTestInDebugMode (v23) instead
+ */
+async function runSelectedTestInDebugModeAttachV22(
+  uri: vscode.Uri,
+  testItem: vscode.TestItem,
+  run: vscode.TestRun,
+  lineNumber?: number,
+  exampleLine?: number,
+  onStepUpdate?: (step: StepResult) => void
+): Promise<number> {
+  logToExtension('=== DEBUG MODE: Starting debug test execution ===', 'INFO');
+  
+  // 1. Check current breakpoints
+  const allBreakpoints = vscode.debug.breakpoints;
+  logToExtension(`Total breakpoints in workspace: ${allBreakpoints.length}`, 'INFO');
+  
+  if (allBreakpoints.length > 0) {
+    logToExtension('Breakpoints details:', 'DEBUG');
+    allBreakpoints.forEach((bp, index) => {
+      if (bp instanceof vscode.SourceBreakpoint) {
+        logToExtension(`  [${index}] ${bp.location.uri.fsPath}:${bp.location.range.start.line + 1} - Enabled: ${bp.enabled}`, 'DEBUG');
+      }
+    });
+  } else {
+    logToExtension('⚠️ WARNING: No breakpoints detected in workspace!', 'WARN');
+    vscode.window.showWarningMessage('No breakpoints set. Set breakpoints in your step definitions before debugging.');
+  }
+  
+  const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
+  if (!workspaceFolder) {
+    vscode.window.showErrorMessage('Feature file is not inside a workspace.');
+    return 1;
+  }
+
+  const workspaceRoot = workspaceFolder.uri.fsPath;
+
+  // Get configuration
+  const config = vscode.workspace.getConfiguration('cucumberJavaEasyRunner');
+  const executionMode = config.get<string>('executionMode', 'java');
+
+  // Currently only Maven mode supports debug
+  if (executionMode !== 'maven') {
+    const action = await vscode.window.showWarningMessage(
+      'Debug mode currently only supports Maven execution mode. Switch to Maven mode?',
+      'Switch to Maven',
+      'Cancel'
+    );
+
+    if (action === 'Switch to Maven') {
+      await config.update('executionMode', 'maven', vscode.ConfigurationTarget.Workspace);
+      vscode.window.showInformationMessage('Switched to Maven mode. Please try debugging again.');
+    }
+    return 1;
+  }
+
+  let debugPort: number | undefined;
+  let debugSession: vscode.DebugSession | undefined;
+
+  try {
+    // ⭐ v21: Always use attach mode (launch mode has mainClass issues with Cucumber)
+    // Provide clear guidance about JaCoCo conflicts
+    const debugConfig = vscode.workspace.getConfiguration('cucumberJavaEasyRunner.debug');
+    const userRequestMode = debugConfig.get<string>('requestMode', 'attach');
+    
+    // v21: Force attach mode and warn about JaCoCo if needed
+    const debugRequestMode = 'attach';
+    
+    if (userRequestMode === 'launch') {
+      logToExtension(`⚠️ v21: launch mode not supported for Cucumber, using attach mode`, 'WARN');
+    }
+    
+  logToExtension(`🎯 v22: Using debug request mode: ${debugRequestMode}`, 'INFO');
+  logToExtension(`⚠️ v22: Using MAVEN_OPTS for JDWP (bypasses pom.xml argLine issues)`, 'WARN');
+  logToExtension(`   MAVEN_OPTS is inherited by Surefire fork, works regardless of pom.xml config`, 'INFO');    // 2. Find Maven module and test class (common for both modes)
+    const moduleInfo = findMavenModule(uri.fsPath, workspaceRoot);
+    const relativePath = path.relative(workspaceRoot, uri.fsPath);
+
+    const configuredTestClass = config.get<string>('testClassName', '');
+    let testClassName: string = configuredTestClass;
+
+    if (!testClassName) {
+      const autoDetectedClass = await findCucumberTestClass(moduleInfo.modulePath);
+      if (!autoDetectedClass) {
+        const userInput = await vscode.window.showInputBox({
+          prompt: 'Enter test class name (e.g., MktSegmentCriteriaUpdateTest)',
+          placeHolder: 'MktSegmentCriteriaUpdateTest'
+        });
+
+        if (!userInput) {
+          vscode.window.showErrorMessage('Test class name not specified, operation cancelled.');
+          return 1;
+        }
+        testClassName = userInput;
+      } else {
+        testClassName = autoDetectedClass;
+      }
+    }
+    
+    // Auto-detect source paths for multi-module projects (common for both modes)
+    const sourcePaths: string[] = [];
+    if (moduleInfo.moduleRelativePath !== '.') {
+      // Multi-module project: add module-specific paths
+      const modulePrefix = moduleInfo.moduleRelativePath.replace(/\\/g, '/');
+      sourcePaths.push(
+        `${modulePrefix}/src/test/java`,
+        `${modulePrefix}/src/main/java`
+      );
+      logToExtension(`Using module-specific source paths: ${sourcePaths.join(', ')}`, 'DEBUG');
+    } else {
+      // Single module project: use default patterns including multi-module wildcards
+      sourcePaths.push(
+        'src/test/java',
+        'src/main/java',
+        '*/src/test/java',
+        '*/src/main/java'
+      );
+      logToExtension(`Using default source paths with wildcards: ${sourcePaths.join(', ')}`, 'DEBUG');
+    }
+    
+    // Extract Maven artifactId as project name for accurate debugging (common for both modes)
+    let projectName: string | undefined;
+    const pomPath = path.join(moduleInfo.modulePath, 'pom.xml');
+    if (fs.existsSync(pomPath)) {
+      const artifactId = await extractMavenArtifactId(pomPath);
+      if (artifactId) {
+        projectName = artifactId;
+        logToExtension(`Extracted Maven artifactId as projectName: ${projectName}`, 'DEBUG');
+      } else {
+        logToExtension(`Failed to extract artifactId from ${pomPath}, will use fallback`, 'WARN');
+      }
+    } else {
+      logToExtension(`pom.xml not found at ${pomPath}, using fallback projectName`, 'DEBUG');
+    }
+    
+    // Fallback to module folder name if extraction fails
+    if (!projectName) {
+      projectName = path.basename(moduleInfo.modulePath);
+      logToExtension(`Using module folder name as projectName: ${projectName}`, 'DEBUG');
+    }
+    
+    // ⭐ v21: Only attach mode supported (launch mode has Cucumber mainClass issues)
+    // Direct to attach mode implementation
+    {
+      // ═══════════════════════════════════════════════════════════════════════
+      // ⭐ v12: ATTACH MODE - Spawn Maven then attach debugger
+      // ═══════════════════════════════════════════════════════════════════════
+      
+      // 1. Allocate debug port
+      debugPort = await DebugPortManager.allocatePort(testItem.id);
+      logToExtension(`Allocated debug port: ${debugPort} for test: ${testItem.label}`, 'INFO');
+      
+      // Verify port is available
+      const net = require('net');
+      const portAvailable = await new Promise<boolean>((resolve) => {
+        const tester = net.createServer();
+        tester.once('error', () => resolve(false));
+        tester.once('listening', () => {
+          tester.close();
+          resolve(true);
+        });
+        tester.listen(debugPort, '127.0.0.1');
+      });
+      logToExtension(`Port ${debugPort} is ${portAvailable ? 'AVAILABLE ✓' : 'IN USE ✗'}`, portAvailable ? 'INFO' : 'ERROR');
+      
+      // 2. Start Maven with JDWP debug parameters
+      logToExtension(`Starting Maven in debug mode on port ${debugPort}`, 'INFO');
+
+      const mavenProcess = await runCucumberTestWithMavenDebug(
+        workspaceRoot,
+        moduleInfo,
+        relativePath,
+        testClassName,
+        debugPort,
+        lineNumber,
+        exampleLine,
+        (data: string) => run.appendOutput(data, undefined, testItem),
+        onStepUpdate
+      );
+
+      // ⭐ v19: Wait for Surefire to start test JVM (not Maven main JVM)
+      // In v19, MAVEN_OPTS doesn't have JDWP, only -DargLine does
+      // So we need to wait for Surefire's forked JVM to output "Listening for transport"
+      await waitForDebugServerWithProgress(mavenProcess, debugPort, testItem.label);
+
+      // 4. Attach debugger
+      logToExtension('Attaching debugger...', 'INFO');
+      logToExtension('⭐ v12: Actively resolving classpath via Java Language Server...', 'INFO');
+      
+      let classPaths: string[] | undefined;
+      try {
+        // 需要取得 test class 的 fully qualified name
+        // 從 testClassName (e.g., "TagClassAdminCrudTest") 找出完整的 class name
+        const testClassFqn = await findTestClassFqn(moduleInfo.modulePath, testClassName);
+        
+        if (testClassFqn) {
+          logToExtension(`Resolving classpath for mainClass: ${testClassFqn}, projectName: ${projectName}`, 'DEBUG');
+          
+          // 呼叫 Java Extension 的 resolveClasspath command
+          const result = await vscode.commands.executeCommand<[string[], string[]]>(
+            'vscode.java.resolveClasspath',
+            testClassFqn,
+            projectName
+          );
+          
+          if (result && result[1]) {
+            classPaths = result[1];
+            logToExtension(`✓ Resolved ${classPaths.length} classpaths from Java Language Server`, 'INFO');
+            logToExtension(`First 3 classpaths: ${classPaths.slice(0, 3).join(', ')}`, 'DEBUG');
+          } else {
+            logToExtension('⚠️ resolveClasspath returned no classpaths, will use undefined', 'WARN');
+          }
+        } else {
+          logToExtension(`⚠️ Could not find fully qualified name for ${testClassName}, using undefined classPaths`, 'WARN');
+        }
+      } catch (error: any) {
+        logToExtension(`⚠️ Error resolving classpath: ${error.message}, will use undefined`, 'WARN');
+      }
+      
+      debugSession = await startDebugSession(
+        workspaceFolder,
+        debugPort,
+        testItem.label,
+        run,
+        sourcePaths,
+        projectName,
+        classPaths,  // ⭐ v12: 傳入主動解析的 classPaths!
+        (message: string, level?: string) => {
+          const validLevel = (level === 'DEBUG' || level === 'INFO' || level === 'WARN' || level === 'ERROR') ? level : 'INFO';
+          logToExtension(message, validLevel);
+        }
+      );
+
+      if (debugSession) {
+        logToExtension(`✓ Debug session started: ${debugSession.id}`, 'INFO');
+        logToExtension(`  Session name: ${debugSession.name}`, 'DEBUG');
+        logToExtension(`  Session type: ${debugSession.type}`, 'DEBUG');
+        logToExtension(`  Port: ${debugPort}`, 'DEBUG');
+        
+        // ⭐ v16: Wait for breakpoints to bind before continuing
+        logToExtension(`⭐ v16: Waiting for breakpoints to bind...`, 'INFO');
+        await new Promise(resolve => setTimeout(resolve, 2000));  // Give debugger time to bind breakpoints
+        
+        // Re-check breakpoints after session start
+        const currentBps = vscode.debug.breakpoints;
+        logToExtension(`Active breakpoints after debug session start: ${currentBps.length}`, 'INFO');
+        
+        // ⭐ v16: Log breakpoint binding status
+        const sourceBps = currentBps.filter(bp => bp instanceof vscode.SourceBreakpoint) as vscode.SourceBreakpoint[];
+        if (sourceBps.length > 0) {
+          logToExtension(`⭐ v16: ${sourceBps.length} source breakpoints detected`, 'INFO');
+          sourceBps.slice(0, 5).forEach((bp, index) => {
+            const file = path.basename(bp.location.uri.fsPath);
+            const line = bp.location.range.start.line + 1;
+            logToExtension(`  [${index + 1}] ${file}:${line} - ${bp.enabled ? 'Enabled' : 'Disabled'}`, 'DEBUG');
+          });
+        } else {
+          logToExtension(`⚠️ v16: No source breakpoints found! Debug may not stop.`, 'WARN');
+        }
+        
+        logToExtension(`💡 Debug Session Tips:`, 'INFO');
+        logToExtension(`  • Breakpoints must be in .java files (step definitions)`, 'INFO');
+        logToExtension(`  • Source paths: ${sourcePaths.join(', ')}`, 'INFO');
+        logToExtension(`  • Test execution will now proceed with debugger attached`, 'INFO');
+        
+        // ⭐ v18: CRITICAL FIX - Resume JVM after breakpoint binding
+        // Problem: suspend=y pauses JVM, but v16/v17 never sent continue command
+        // Result: JVM hangs forever, test never executes
+        try {
+          logToExtension(`⭐ v18: Sending continue command to resume JVM...`, 'INFO');
+          await debugSession.customRequest('continue');
+          logToExtension(`✓ v18: JVM resumed successfully`, 'INFO');
+        } catch (error: any) {
+          logToExtension(`⚠️ v18: Failed to resume JVM: ${error.message}`, 'WARN');
+          logToExtension(`  The debugger may not support 'continue' request`, 'WARN');
+        }
+        
+        vscode.window.showInformationMessage(
+          `Debugger attached to ${testItem.label} on port ${debugPort}`
+        );
+      } else {
+        logToExtension('⚠️ WARNING: Debug session started but not active!', 'WARN');
+      }
+
+      // 6. Wait for process to complete
+      const exitCode = await new Promise<number>((resolve) => {
+        mavenProcess.on('close', (code: number | null) => {
+          resolve(typeof code === 'number' ? code : 1);
+        });
+      });
+
+      logToExtension(`Maven process exited with code: ${exitCode}`, 'INFO');
+      return exitCode;
+    }  // End of attach mode branch
+
+  } catch (error: any) {
+    logToExtension(`Debug mode error: ${error.message}`, 'ERROR');
+
+    // Handle error and offer fallback
+    const shouldContinue = await handleDebugError(error);
+
+    if (shouldContinue) {
+      // Fallback to normal run mode
+      logToExtension('Falling back to normal run mode', 'WARN');
+      return await runSelectedTestAndWait(
+        uri,
+        lineNumber,
+        exampleLine,
+        (data) => run.appendOutput(data, undefined, testItem),
+        onStepUpdate
+      );
+    }
+
+    return 1;
+
+  } finally {
+    // 7. Cleanup: release debug port
+    if (debugPort) {
+      DebugPortManager.releasePort(debugPort);
+      logToExtension(`Released debug port: ${debugPort}`, 'INFO');
+    }
+  }
+}
+
+/**
  * Finds the scenario at the given line number
  */
 function findScenarioAtLine(document: vscode.TextDocument, line: number): ScenarioInfo | null {
@@ -1683,6 +2266,425 @@ async function findGluePath(projectRoot: string): Promise<string | null> {
 /**
  * Finds Cucumber test class names in the module
  */
+
+/**
+ * v23.3: Extract tags from Feature file
+ * 
+ * Parses Feature file and extracts all @tag annotations
+ * Tags can appear at Feature level or Scenario level
+ * 
+ * Example Feature file:
+ * ```
+ * @mkt_segment_criteria_update_test
+ * @integration
+ * Feature: MKT05A06R01-MktSegment-Criteria 更新邏輯驗證
+ * 
+ *   @smoke
+ *   Scenario: 01 - [創建新 segment]
+ * ```
+ * 
+ * @param featureFilePath - Absolute path to .feature file
+ * @returns Array of tag names (without @ prefix)
+ */
+async function extractTagsFromFeature(featureFilePath: string): Promise<string[]> {
+  try {
+    if (!fs.existsSync(featureFilePath)) {
+      logToExtension(`[v23.3] Feature file not found: ${featureFilePath}`, 'WARN');
+      return [];
+    }
+
+    // Check cache first
+    const stats = fs.statSync(featureFilePath);
+    const currentMtime = stats.mtimeMs;
+    
+    if (tagCache[featureFilePath] && tagCache[featureFilePath].mtime === currentMtime) {
+      logToExtension(`[v23.3] Using cached tags for feature (${tagCache[featureFilePath].tags.length} tags)`, 'DEBUG');
+      return tagCache[featureFilePath].tags;
+    }
+
+    const content = fs.readFileSync(featureFilePath, 'utf8');
+    const lines = content.split('\n');
+    const tags: string[] = [];
+
+    // Extract tags from Feature level (before "Feature:" keyword)
+    // Stop at first non-comment, non-tag, non-blank line
+    for (const line of lines) {
+      const trimmed = line.trim();
+      
+      // Skip comments and blank lines
+      if (trimmed.startsWith('#') || trimmed === '') {
+        continue;
+      }
+      
+      // Stop when we hit Feature keyword
+      if (trimmed.startsWith('Feature:')) {
+        break;
+      }
+      
+      // Extract tags (lines starting with @)
+      if (trimmed.startsWith('@')) {
+        // Split multiple tags on same line: @tag1 @tag2 @tag3
+        const lineTags = trimmed.match(/@[\w_]+/g);
+        if (lineTags) {
+          lineTags.forEach(tag => {
+            const tagName = tag.substring(1); // Remove @ prefix
+            if (!tags.includes(tagName)) {
+              tags.push(tagName);
+            }
+          });
+        }
+      }
+    }
+
+    // Update cache
+    tagCache[featureFilePath] = {
+      tags: tags,
+      mtime: currentMtime
+    };
+
+    logToExtension(`[v23.3] Extracted ${tags.length} tags from feature: ${tags.join(', ')}`, 'DEBUG');
+    return tags;
+
+  } catch (error: any) {
+    logToExtension(`[v23.3] Error extracting tags from feature: ${error.message}`, 'ERROR');
+    return [];
+  }
+}
+
+/**
+ * v23.3: Extract tags from Test Class file
+ * 
+ * Parses Java test class and extracts tags from:
+ * 1. @ConfigurationParameter (Cucumber 7+, highest priority)
+ * 2. @CucumberOptions (Legacy support)
+ * 
+ * Pattern 1 - @ConfigurationParameter (v23.3 NEW):
+ * ```java
+ * @ConfigurationParameter(
+ *     key = Constants.FILTER_TAGS_PROPERTY_NAME,
+ *     value = "@mkt_segment_criteria_update_test")
+ * 
+ * @ConfigurationParameter(
+ *     key = Constants.FILTER_TAGS_PROPERTY_NAME,
+ *     value = "@tag1 or @tag2 or @tag3")
+ * ```
+ * 
+ * Pattern 2 - @CucumberOptions (Legacy):
+ * ```java
+ * @CucumberOptions(tags = "@mkt_segment_criteria_update_test")
+ * @CucumberOptions(tags = {"@tag1", "@tag2"})
+ * ```
+ * 
+ * @param testClassPath - Absolute path to *Test.java file
+ * @returns Array of tag names (without @ prefix)
+ */
+async function extractTagsFromTestClass(testClassPath: string): Promise<string[]> {
+  try {
+    if (!fs.existsSync(testClassPath)) {
+      logToExtension(`[v23.3] Test class not found: ${testClassPath}`, 'DEBUG');
+      return [];
+    }
+
+    // Check cache first
+    const stats = fs.statSync(testClassPath);
+    const currentMtime = stats.mtimeMs;
+    
+    if (tagCache[testClassPath] && tagCache[testClassPath].mtime === currentMtime) {
+      return tagCache[testClassPath].tags;
+    }
+
+    const content = fs.readFileSync(testClassPath, 'utf8');
+    const tags: string[] = [];
+
+    // ⭐ Priority 1: @ConfigurationParameter (Cucumber 7+)
+    // Pattern: @ConfigurationParameter(key = Constants.FILTER_TAGS_PROPERTY_NAME, value = "...")
+    // Multi-line support with string concatenation:
+    //   @ConfigurationParameter(
+    //       key = Constants.FILTER_TAGS_PROPERTY_NAME,
+    //       value = "@tag1 or @tag2"
+    //               + " or @tag3")
+    
+    // Strategy: Find the entire annotation block, then extract all @tag patterns
+    const configParamRegex = /@ConfigurationParameter\s*\(\s*key\s*=\s*Constants\.FILTER_TAGS_PROPERTY_NAME\s*,\s*value\s*=\s*([^)]+)\)/gs;
+    let configMatch;
+    
+    while ((configMatch = configParamRegex.exec(content)) !== null) {
+      const valueBlock = configMatch[1];
+      
+      // Extract all @tag patterns from the entire value block
+      // This handles both simple strings and Java string concatenation (+ "...")
+      const tagMatches = valueBlock.match(/@[\w_]+/g);
+      
+      if (tagMatches) {
+        tagMatches.forEach(tag => {
+          const tagName = tag.substring(1); // Remove @ prefix
+          if (!tags.includes(tagName)) {
+            tags.push(tagName);
+          }
+        });
+      }
+    }
+
+    // ⭐ Priority 2: @CucumberOptions (Legacy support)
+    // Only search if no tags found from @ConfigurationParameter
+    if (tags.length === 0) {
+      const cucumberOptionsMatch = content.match(/@CucumberOptions\s*\([^)]*tags\s*=\s*([^)]+)\)/s);
+      
+      if (cucumberOptionsMatch) {
+        const tagsContent = cucumberOptionsMatch[1];
+        
+        // Extract all @tag patterns
+        const tagMatches = tagsContent.match(/@[\w_]+/g);
+        
+        if (tagMatches) {
+          tagMatches.forEach(tag => {
+            const tagName = tag.substring(1); // Remove @ prefix
+            if (!tags.includes(tagName)) {
+              tags.push(tagName);
+            }
+          });
+        }
+      }
+    }
+
+    // Update cache
+    tagCache[testClassPath] = {
+      tags: tags,
+      mtime: currentMtime
+    };
+
+    logToExtension(`[v23.3] Extracted ${tags.length} tags from test class ${path.basename(testClassPath)}: ${tags.join(', ')}`, 'DEBUG');
+    return tags;
+
+  } catch (error: any) {
+    logToExtension(`[v23.3] Error extracting tags from test class: ${error.message}`, 'ERROR');
+    return [];
+  }
+}
+
+/**
+ * v23.3.1: Extract glue package from Test Class file
+ * 
+ * Parses Java test class and extracts glue package from @ConfigurationParameter
+ * 
+ * Pattern:
+ * ```java
+ * @ConfigurationParameter(
+ *     key = Constants.GLUE_PROPERTY_NAME,
+ *     value = "tw.datahunter.spring.system")
+ * ```
+ * 
+ * @param testClassPath - Absolute path to *Test.java file
+ * @returns Glue package string or null if not found
+ */
+async function extractGluePackageFromTestClass(testClassPath: string): Promise<string | null> {
+  try {
+    if (!fs.existsSync(testClassPath)) {
+      logToExtension(`[v23.3.1] Test class not found: ${testClassPath}`, 'DEBUG');
+      return null;
+    }
+
+    const content = fs.readFileSync(testClassPath, 'utf8');
+
+    // Pattern: @ConfigurationParameter(key = Constants.GLUE_PROPERTY_NAME, value = "package.name")
+    // Match entire annotation block until closing )
+    const glueParamRegex = /@ConfigurationParameter\s*\(\s*key\s*=\s*Constants\.GLUE_PROPERTY_NAME\s*,\s*value\s*=\s*"([^"]+)"/gs;
+    const match = glueParamRegex.exec(content);
+    
+    if (match && match[1]) {
+      const gluePackage = match[1].trim();
+      logToExtension(`[v23.3.1] Extracted glue package from @ConfigurationParameter: ${gluePackage}`, 'DEBUG');
+      return gluePackage;
+    }
+
+    logToExtension(`[v23.3.1] No glue package found in @ConfigurationParameter`, 'DEBUG');
+    return null;
+
+  } catch (error: any) {
+    logToExtension(`[v23.3.1] Error extracting glue package: ${error.message}`, 'ERROR');
+    return null;
+  }
+}
+
+/**
+ * v23.3: Match test class by tag comparison
+ * 
+ * Finds test class that has matching tags with the feature file
+ * Uses tag intersection to find best match
+ * 
+ * Strategy:
+ * 1. Extract tags from feature file
+ * 2. Search all *Test.java files in test directory
+ * 3. Extract tags from each test class (@ConfigurationParameter or @CucumberOptions)
+ * 4. Find test class with maximum tag overlap
+ * 
+ * @param modulePath - Path to Maven module
+ * @param featureFilePath - Path to feature file
+ * @returns Test class name if found, null otherwise
+ */
+async function matchTestClassByTag(
+  modulePath: string,
+  featureFilePath: string
+): Promise<string | null> {
+  try {
+    // Step 1: Extract tags from feature file
+    const featureTags = await extractTagsFromFeature(featureFilePath);
+    
+    if (featureTags.length === 0) {
+      logToExtension(`[v23.3] No tags found in feature file, skipping tag-based matching`, 'DEBUG');
+      return null;
+    }
+
+    logToExtension(`[v23.3] Feature tags: [${featureTags.join(', ')}]`, 'INFO');
+
+    // Step 2: Find all test classes
+    const testDir = path.join(modulePath, 'src', 'test', 'java');
+    if (!fs.existsSync(testDir)) {
+      logToExtension(`[v23.3] Test directory not found: ${testDir}`, 'WARN');
+      return null;
+    }
+
+    const pattern = path.join(testDir, '**', '*Test.java');
+    const testFiles = glob.sync(pattern, { nodir: true });
+
+    if (testFiles.length === 0) {
+      logToExtension(`[v23.3] No test files found in ${testDir}`, 'WARN');
+      return null;
+    }
+
+    logToExtension(`[v23.3] Searching ${testFiles.length} test files for tag match...`, 'DEBUG');
+
+    // Step 3: Find best matching test class
+    let bestMatch: { file: string; score: number } | null = null;
+
+    for (const testFile of testFiles) {
+      const testTags = await extractTagsFromTestClass(testFile);
+      
+      if (testTags.length === 0) {
+        continue;
+      }
+
+      // Calculate intersection score
+      const intersection = featureTags.filter(tag => testTags.includes(tag));
+      const score = intersection.length;
+
+      if (score > 0) {
+        logToExtension(`[v23.3] Match found: ${path.basename(testFile)} - ${score} common tags: [${intersection.join(', ')}]`, 'DEBUG');
+        
+        if (!bestMatch || score > bestMatch.score) {
+          bestMatch = { file: testFile, score };
+        }
+      }
+    }
+
+    // Step 4: Return best match
+    if (bestMatch) {
+      const className = path.basename(bestMatch.file, '.java');
+      logToExtension(`[v23.3] ⭐ Tag-based match selected: ${className} (score: ${bestMatch.score})`, 'INFO');
+      return className;
+    }
+
+    logToExtension(`[v23.3] No test class found with matching tags`, 'DEBUG');
+    return null;
+
+  } catch (error: any) {
+    logToExtension(`[v23.3] Error in tag-based matching: ${error.message}`, 'ERROR');
+    return null;
+  }
+}
+
+/**
+ * v23.3: Smart detection - infer test class from feature file
+ * 
+ * Three-layer strategy:
+ * 1. Tag-based matching (v23.3 with @ConfigurationParameter) - Most accurate
+ * 2. Folder code matching (v23.1) - Structural matching
+ * 3. Filename similarity (v23.0) - Fallback
+ * 
+ * Example:
+ * Feature: .../MKT05A06R01-mktSegment_CriteriaUpdate.feature
+ *   @mkt_segment_criteria_update_test
+ * → Test Class: .../MKT05A06/MktSegmentCriteriaUpdateTest.java
+ *   @ConfigurationParameter(key = Constants.FILTER_TAGS_PROPERTY_NAME, 
+ *                          value = "@mkt_segment_criteria_update_test")
+ */
+async function findCucumberTestClassFromFeature(
+  modulePath: string,
+  featureFilePath: string
+): Promise<string | null> {
+  logToExtension(`[v23.3] === Smart Test Class Detection ===`, 'DEBUG');
+  logToExtension(`[v23.3] Feature: ${path.basename(featureFilePath)}`, 'DEBUG');
+
+  // ⭐ Strategy 1: Tag-based matching (v23.3 - Highest priority)
+  logToExtension(`[v23.3] Strategy 1: Tag-based matching...`, 'DEBUG');
+  const tagMatch = await matchTestClassByTag(modulePath, featureFilePath);
+  if (tagMatch) {
+    logToExtension(`[v23.3] ✓ Tag-based match found: ${tagMatch}`, 'INFO');
+    return tagMatch;
+  }
+
+  // Strategy 2: Folder code matching (v23.1 - Medium priority)
+  logToExtension(`[v23.3] Strategy 2: Folder code matching...`, 'DEBUG');
+  const featureFileName = path.basename(featureFilePath, '.feature');
+  
+  // Extract folder code pattern: MKT05A06R01-xxx → MKT05A06
+  // Pattern: [LETTERS][DIGITS][LETTERS][DIGITS] stops before R[DIGITS]
+  // MKT05A06R01 → MKT05A06 (stop before R01)
+  // MKT01R01 → MKT01 (stop before R01)
+  let folderCode = '';
+  const folderMatch = featureFileName.match(/^([A-Z]+\d+[A-Z]*\d*)(?=R\d+|-|$)/);
+  if (folderMatch) {
+    folderCode = folderMatch[1];
+  } else {
+    // Fallback: try simple pattern (all uppercase and digits until dash or R)
+    const simpleMatch = featureFileName.match(/^([A-Z0-9]+?)(?=R\d+|-)/);
+    if (simpleMatch) {
+      folderCode = simpleMatch[1];
+    }
+  }
+  
+  if (!folderCode) {
+    logToExtension(`[v23.3] Cannot extract folder code from feature: ${featureFileName}`, 'WARN');
+    return null;
+  }
+  
+  logToExtension(`[v23.3] Extracted folder code: ${folderCode} from ${featureFileName}`, 'DEBUG');
+  
+  // Search for test class in corresponding folder
+  const testDir = path.join(modulePath, 'src', 'test', 'java');
+  const expectedFolder = path.join(testDir, '**', folderCode);
+  
+  // Find all test classes in this folder
+  const pattern = path.join(testDir, '**', folderCode, '*Test.java');
+  
+  try {
+    const files = glob.sync(pattern, { nodir: true });
+    
+    if (files.length === 0) {
+      logToExtension(`[v23.3] No test class found in folder: ${folderCode}`, 'WARN');
+      return null;
+    }
+    
+    // Strategy 3: Filename similarity matching (v23.0 - Lowest priority)
+    logToExtension(`[v23.3] Strategy 3: Filename similarity matching...`, 'DEBUG');
+    const featureBaseName = featureFileName.replace(/^[A-Z0-9]+-/, ''); // Remove prefix
+    const preferredFile = files.find((f: string) => {
+      const fileName = path.basename(f, '.java');
+      return fileName.toLowerCase().includes(featureBaseName.toLowerCase().replace(/-/g, ''));
+    });
+    
+    const selectedFile = preferredFile || files[0];
+    const className = path.basename(selectedFile, '.java');
+    
+    logToExtension(`[v23.3] ✓ Folder + filename match found: ${className}`, 'INFO');
+    return className;
+    
+  } catch (error: any) {
+    logToExtension(`[v23.3] Error finding test class: ${error.message}`, 'ERROR');
+    return null;
+  }
+}
+
 async function findCucumberTestClass(modulePath: string): Promise<string | null> {
   const testDir = path.join(modulePath, 'src', 'test', 'java');
 
@@ -1694,6 +2696,63 @@ async function findCucumberTestClass(modulePath: string): Promise<string | null>
   const testClass = await findTestClassWithCucumberAnnotations(testDir);
 
   return testClass;
+}
+
+/**
+ * Finds the fully qualified name (FQN) of a test class
+ * @param modulePath - Path to the Maven module
+ * @param testClassName - Simple class name (e.g., "TagClassAdminCrudTest")
+ * @returns Fully qualified class name (e.g., "tw.datahunter.uc_api.bdd.TagClassAdminCrudTest") or null
+ */
+async function findTestClassFqn(modulePath: string, testClassName: string): Promise<string | null> {
+  const testDir = path.join(modulePath, 'src', 'test', 'java');
+
+  if (!fs.existsSync(testDir)) {
+    logToExtension(`Test directory not found: ${testDir}`, 'WARN');
+    return null;
+  }
+
+  // Recursively search for the test class file
+  const testClassPath = await findTestClassPath(testDir, testClassName);
+  
+  if (!testClassPath) {
+    logToExtension(`Test class file not found for: ${testClassName}`, 'WARN');
+    return null;
+  }
+
+  // Convert file path to package name
+  // e.g., /path/to/src/test/java/tw/datahunter/uc_api/bdd/TagClassAdminCrudTest.java
+  //    -> tw.datahunter.uc_api.bdd.TagClassAdminCrudTest
+  const relativePath = path.relative(testDir, testClassPath);
+  const fqn = relativePath
+    .replace(/\\/g, '/')           // Normalize path separators
+    .replace(/\.java$/, '')        // Remove .java extension
+    .replace(/\//g, '.');          // Convert path to package notation
+  
+  logToExtension(`Found FQN for ${testClassName}: ${fqn}`, 'DEBUG');
+  return fqn;
+}
+
+/**
+ * Recursively searches for a test class file by simple name
+ */
+async function findTestClassPath(dir: string, className: string): Promise<string | null> {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    
+    if (entry.isDirectory()) {
+      const result = await findTestClassPath(fullPath, className);
+      if (result) {
+        return result;
+      }
+    } else if (entry.name === `${className}.java`) {
+      return fullPath;
+    }
+  }
+  
+  return null;
 }
 
 /**
@@ -2051,6 +3110,159 @@ async function runCucumberTestWithMaven(
 }
 
 /**
+ * Runs the Cucumber test using Maven test command in DEBUG mode
+ * Returns the child process so caller can wait for debug attach before completion
+ */
+async function runCucumberTestWithMavenDebug(
+  workspaceRoot: string,
+  moduleInfo: ModuleInfo,
+  featurePath: string,
+  testClassName: string,
+  debugPort: number,
+  lineNumber?: number,
+  exampleLineNumber?: number,
+  onOutput?: (chunk: string) => void,
+  onStepUpdate?: (step: StepResult) => void
+): Promise<any> {
+  // Get configuration
+  const config = vscode.workspace.getConfiguration('cucumberJavaEasyRunner');
+  const mavenArgs = config.get<string>('mavenArgs', '');
+  const mavenProfile = config.get<string>('mavenProfile', '');
+  const cucumberTags = config.get<string>('cucumberTags', '');
+  const showStepResults = config.get<boolean>('showStepResults', true);
+  const envVars = config.get<{ [key: string]: string }>('environmentVariables', {});
+
+  // Convert feature path to classpath format
+  const classpathFeature = convertToClasspathFormat(featurePath, moduleInfo.moduleRelativePath);
+
+  // Build the cucumber.features parameter
+  let cucumberFeatures = classpathFeature;
+  if (lineNumber && lineNumber > 0) {
+    if (exampleLineNumber && exampleLineNumber > 0) {
+      cucumberFeatures += ':' + exampleLineNumber;
+    } else {
+      cucumberFeatures += ':' + lineNumber;
+    }
+  }
+
+  // Build Maven arguments
+  const mvnArgs = ['test'];
+
+  // Add Maven profile
+  if (mavenProfile) {
+    mvnArgs.push(`-P${mavenProfile}`);
+  }
+
+  mvnArgs.push(`-Dcucumber.features=${cucumberFeatures}`);
+
+  // Add tags filter
+  if (cucumberTags) {
+    mvnArgs.push(`-Dcucumber.filter.tags=${cucumberTags}`);
+  }
+
+  mvnArgs.push(`-Dtest=${testClassName}`);
+
+  // Add -pl parameter for multi-module projects
+  if (moduleInfo.moduleRelativePath !== '.') {
+    mvnArgs.push('-pl', moduleInfo.moduleRelativePath.replace(/\\/g, '/'));
+  }
+
+  // **KEY DIFFERENCE: Add debug parameters**
+  const jdwpArgs = buildJdwpArgsForMaven(debugPort);
+  const jdwpAgentArg = `-agentlib:jdwp=${jdwpArgs}`;
+  
+  // ⭐ v22: Disable JaCoCo (if present) but DON'T use -DargLine
+  // Reason: -DargLine only works if pom.xml explicitly has ${argLine} placeholder
+  //         Many projects configure Surefire without ${argLine}, breaking -DargLine
+  // Solution: Use MAVEN_OPTS instead (set below in spawnEnv)
+  mvnArgs.push('-Djacoco.skip=true');
+  mvnArgs.push('-Dmaven.jacoco.skip=true');
+  // ❌ v22: Removed -DargLine (doesn't work when pom.xml lacks ${argLine})
+  
+  // Add additional Maven arguments
+  if (mavenArgs) {
+    mvnArgs.push(...mavenArgs.split(' ').filter(arg => arg.length > 0));
+  }
+  
+  logToExtension(`Maven DEBUG command: mvn ${mvnArgs.join(' ')}`, 'INFO');
+  logToExtension(`JDWP will be passed via MAVEN_OPTS (inherited by Surefire fork)`, 'DEBUG');
+  logToExtension(`Disabling JaCoCo plugin completely in debug mode`, 'DEBUG');
+
+  // Create output parser with step status callback
+  const parser = cucumberOutputChannel ? new CucumberOutputParser(cucumberOutputChannel, showStepResults, onStepUpdate) : null;
+
+  // ⭐ v22: CRITICAL FIX - Use MAVEN_OPTS for Surefire inheritance
+  // Problem in v21: -DargLine doesn't work when pom.xml has <configuration> without ${argLine}
+  //                 Many projects configure Surefire but forget to add ${argLine} placeholder
+  // Solution: Use MAVEN_OPTS - Surefire ALWAYS inherits parent JVM's MAVEN_OPTS
+  //           This bypasses pom.xml argLine configuration entirely
+  // Note: No port conflict because Maven main JVM doesn't fork during test phase
+  const spawnEnv = { 
+    ...process.env, 
+    ...envVars,
+    MAVEN_OPTS: jdwpAgentArg  // ✅ v22: Surefire fork will inherit this
+  };
+
+  // **IMPORTANT: No grep filtering in debug mode to see debug messages**
+  const mvnCommand = `mvn ${mvnArgs.join(' ')}`;
+
+	logToExtension(`Starting Maven in debug mode...`, 'INFO');
+	logToExtension(`Working directory: ${workspaceRoot}`, 'DEBUG');
+	logToExtension(`Full Maven command: ${mvnCommand}`, 'DEBUG');
+	
+	// Log all debug-related environment variables
+	const envEntries = Object.entries(spawnEnv as Record<string, string>);
+	envEntries.filter(([key]) => key.includes('JAVA') || key.includes('MAVEN')).forEach(([key, value]) => {
+		logToExtension(`  ${key}=${value}`, 'DEBUG');
+	});
+
+	const child = spawn('sh', ['-c', mvnCommand], { cwd: workspaceRoot, env: spawnEnv });
+	logToExtension(`Maven debug process started (PID: ${child.pid})`, 'INFO');
+	logToExtension(`Waiting for JDWP server to start on port ${debugPort}...`, 'INFO');  // Set up output handling
+  child.stdout?.on('data', (chunk: Buffer) => {
+    const output = chunk.toString();
+
+    // Parse output for step results
+    if (parser) {
+      const lines = output.split('\n');
+      for (const line of lines) {
+        parser.parseLine(line);
+      }
+    }
+
+    // Forward to output channel
+    if (onOutput) {
+      onOutput(output);
+    }
+
+    // Also log to output channel
+    if (cucumberOutputChannel) {
+      cucumberOutputChannel.append(output);
+    }
+  });
+
+  child.stderr?.on('data', (chunk: Buffer) => {
+    const errorOutput = chunk.toString();
+    logToExtension(`Maven stderr: ${errorOutput.substring(0, 200)}`, 'DEBUG');
+
+    if (onOutput) {
+      onOutput(errorOutput);
+    }
+
+    if (cucumberOutputChannel) {
+      cucumberOutputChannel.append(errorOutput);
+    }
+  });
+
+  child.on('error', (err) => {
+    logToExtension(`Maven process error: ${err.message}`, 'ERROR');
+  });
+
+  // Return the process so caller can wait for it
+  return child;
+}
+
+/**
  * Runs the Cucumber test using Maven test command and returns the exit code
  */
 async function runCucumberTestWithMavenResult(
@@ -2265,6 +3477,179 @@ async function runCucumberTestWithMavenResult(
   });
 }
 
+/**
+ * v23: Execute Cucumber test using Launch Mode (Direct Cucumber CLI execution)
+ * 
+ * This function bypasses Maven/Surefire/JaCoCo completely by:
+ * 1. Resolving classpath programmatically via mvn dependency:build-classpath
+ * 2. Launching Cucumber CLI directly via VS Code Debug API
+ * 3. Using noDebug flag to unify run/debug execution paths
+ * 
+ * Benefits over v16-v22 (Attach Mode):
+ * - ✅ No JDWP injection conflicts with JaCoCo/pom.xml
+ * - ✅ Breakpoints work reliably without pom.xml modifications
+ * - ✅ Faster startup (no Maven test phase overhead)
+ * - ✅ Unified run/debug logic (single code path)
+ * 
+ * @param workspaceRoot - Absolute path to workspace root
+ * @param workspaceFolder - VS Code workspace folder
+ * @param moduleInfo - Maven module information
+ * @param featurePath - Relative path to .feature file
+ * @param testClassPath - Absolute path to test class file (for glue package extraction)
+ * @param isDebug - true for debug mode, false for run mode
+ * @param lineNumber - Optional scenario line number
+ * @param projectName - Maven project name (optional)
+ * @param sourcePaths - Source paths for debugging (optional)
+ * @param onOutput - Output callback
+ * @returns Promise<number> - Exit code
+ */
+async function runCucumberTestV23LaunchMode(
+  workspaceRoot: string,
+  workspaceFolder: vscode.WorkspaceFolder,
+  moduleInfo: ModuleInfo,
+  featurePath: string,
+  testClassPath: string,
+  isDebug: boolean,
+  lineNumber?: number,
+  projectName?: string,
+  sourcePaths?: string[],
+  onOutput?: (chunk: string) => void
+): Promise<number> {
+  logToExtension(`⭐ v23: Executing Cucumber test using Launch Mode`, 'INFO');
+  logToExtension(`  Mode: ${isDebug ? 'DEBUG' : 'RUN'}`, 'INFO');
+  logToExtension(`  Feature: ${featurePath}`, 'DEBUG');
+  logToExtension(`  Test class: ${testClassPath}`, 'DEBUG');
+
+  try {
+    // Step 1: Validate Maven project
+    if (!isValidMavenProject(moduleInfo.modulePath)) {
+      throw new Error(`Not a valid Maven project: ${moduleInfo.modulePath}`);
+    }
+
+    // Step 2: Resolve Maven classpath programmatically
+    logToExtension('[v23] Step 1: Resolving Maven classpath...', 'INFO');
+    const classPaths = await resolveMavenClasspath(
+      moduleInfo.modulePath,
+      (msg, level) => logToExtension(msg, level as any)
+    );
+
+    if (classPaths.length === 0) {
+      throw new Error('Failed to resolve Maven classpath');
+    }
+
+    logToExtension(`[v23] ✓ Resolved ${classPaths.length} classpath entries`, 'INFO');
+
+    // Step 3: Extract glue package from test class
+    // Priority 1: From @ConfigurationParameter(key = GLUE_PROPERTY_NAME, value = "...")
+    // Priority 2: From test class file path
+    let gluePackage = await extractGluePackageFromTestClass(testClassPath);
+    
+    if (!gluePackage) {
+      // Fallback to path-based extraction
+      gluePackage = extractGluePackage(testClassPath, moduleInfo.modulePath);
+      logToExtension(`[v23.3.1] Using path-based glue package: ${gluePackage}`, 'DEBUG');
+    } else {
+      logToExtension(`[v23.3.1] Using @ConfigurationParameter glue package: ${gluePackage}`, 'INFO');
+    }
+    
+    logToExtension(`[v23] Glue package: ${gluePackage || '(empty - will scan all)'}`, 'DEBUG');
+
+    // Step 4: Build Cucumber CLI arguments
+    const absoluteFeaturePath = path.isAbsolute(featurePath)
+      ? featurePath
+      : path.join(workspaceRoot, featurePath);
+
+    const cucumberArgs = buildCucumberArgs(
+      absoluteFeaturePath,
+      gluePackage,
+      lineNumber,
+      moduleInfo.modulePath
+    );
+
+    logToExtension(`[v23] Cucumber args: ${cucumberArgs.join(' ')}`, 'DEBUG');
+
+    // Step 5: Create Launch Mode debug configuration
+    logToExtension('[v23] Step 2: Creating Launch Mode configuration...', 'INFO');
+    const debugConfig = createCucumberLaunchConfig(
+      workspaceFolder,
+      cucumberArgs,
+      classPaths,
+      isDebug,
+      moduleInfo.modulePath,  // ⭐ v23.32: Pass module path for correct cwd
+      projectName,
+      sourcePaths,
+      (msg, level) => logToExtension(msg, level as any)
+    );
+
+    // Step 6: Start debug/run session via VS Code Debug API
+    logToExtension(`[v23] Step 3: Starting ${isDebug ? 'debug' : 'run'} session...`, 'INFO');
+    
+    const started = await vscode.debug.startDebugging(
+      workspaceFolder,
+      debugConfig
+    );
+
+    if (!started) {
+      throw new Error('Failed to start debug session');
+    }
+
+    logToExtension(`[v23] ✓ ${isDebug ? 'Debug' : 'Run'} session started`, 'INFO');
+
+    // Get active debug session
+    const activeSession = vscode.debug.activeDebugSession;
+    if (activeSession) {
+      logToExtension(`[v23] Active session: ${activeSession.name} (${activeSession.id})`, 'DEBUG');
+    }
+
+    if (isDebug) {
+      // Wait for breakpoints to bind
+      logToExtension('[v23] Waiting for breakpoints to bind...', 'DEBUG');
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      const breakpoints = vscode.debug.breakpoints;
+      logToExtension(`[v23] Active breakpoints: ${breakpoints.length}`, 'INFO');
+
+      vscode.window.showInformationMessage(
+        `🐛 Debugger started for ${path.basename(featurePath)}${lineNumber ? `:${lineNumber}` : ''}`
+      );
+    } else {
+      vscode.window.showInformationMessage(
+        `▶️  Running ${path.basename(featurePath)}${lineNumber ? `:${lineNumber}` : ''}`
+      );
+    }
+
+    // Step 7: Wait for session to complete
+    // We need to track which session we started since VS Code doesn't return session object
+    const sessionName = debugConfig.name;
+    
+    return await new Promise<number>((resolve) => {
+      const disposable = vscode.debug.onDidTerminateDebugSession((session) => {
+        if (session.name === sessionName || session.configuration.mainClass === 'io.cucumber.core.cli.Main') {
+          logToExtension(`[v23] Debug session terminated: ${session.name}`, 'INFO');
+          disposable.dispose();
+          resolve(0); // Assume success (VS Code doesn't provide exit code easily)
+        }
+      });
+
+      // Timeout fallback (30 minutes)
+      setTimeout(() => {
+        logToExtension('[v23] ⚠️ Debug session timeout (30 min)', 'WARN');
+        disposable.dispose();
+        resolve(1);
+      }, 30 * 60 * 1000);
+    });
+
+  } catch (error: any) {
+    logToExtension(`[v23] ❌ Error: ${error.message}`, 'ERROR');
+    logToExtension(`[v23] Stack: ${error.stack}`, 'DEBUG');
+    vscode.window.showErrorMessage(`Cucumber test failed: ${error.message}`);
+    return 1;
+  }
+}
+
 // Deactivate function - called when extension is deactivated
-// eslint-disable-next-line @typescript-eslint/no-empty-function
-export function deactivate() {} 
+export function deactivate() {
+  // Cleanup debug ports
+  DebugPortManager.cleanup();
+  logToExtension('Extension deactivated, debug ports cleaned up', 'INFO');
+} 
