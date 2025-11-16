@@ -642,6 +642,11 @@ class CucumberTestController {
       const backgroundStepsOrder: vscode.TestItem[] = []; // Track Background steps execution order
       const processedSteps = new Set<string>(); // Track which steps have been updated
 
+      // NEW v26.2: Track Before containers for each scenario (for Feature-level execution)
+      const scenarioBeforeContainers = new Map<string, vscode.TestItem>(); // Map scenario ID to its Before container
+      const scenarioBackgroundMaps = new Map<string, Map<string, vscode.TestItem>>(); // Map scenario ID to its background steps map
+      const scenarioBackgroundOrders = new Map<string, vscode.TestItem[]>(); // Map scenario ID to its background steps order
+      
       // If running a scenario, collect all step children IN ORDER (sorted by line number)
       if (testItem.id.includes(':scenario:') && !testItem.id.includes(':step:')) {
         logToExtension(`╔═══════════════════════════════════════════════════════════════╗`, 'INFO');
@@ -710,6 +715,10 @@ class CucumberTestController {
       // Callback for real-time step status updates
       // Each step goes through lifecycle: started() → passed()/failed()/skipped()
       // This callback is invoked by CucumberOutputParser when it detects step completion
+      
+      // Track current scenario being executed (for Feature-level execution)
+      let currentScenarioId: string | undefined = undefined;
+      
       const onStepUpdate = (stepResult: StepResult) => {
         const stepText = `${stepResult.keyword} ${stepResult.name}`;
         let stepItem: vscode.TestItem | undefined = undefined;
@@ -781,6 +790,20 @@ class CucumberTestController {
           }
           
           stepItem = selectedStep.item;
+          
+          // CRITICAL v26.2: Track current scenario for Feature-level execution
+          // Extract scenario ID from step ID: "...feature:...:scenario:LINE:step:LINE"
+          if (stepItem.id.includes(':scenario:')) {
+            const parts = stepItem.id.split(':scenario:');
+            if (parts.length > 1) {
+              // Get scenario ID up to (but not including) ":step:"
+              const afterScenario = parts[1];
+              const scenarioLineAndRest = afterScenario.split(':step:')[0];
+              currentScenarioId = `${parts[0]}:scenario:${scenarioLineAndRest}`;
+              logToExtension(`  📍 Current scenario ID updated: ${currentScenarioId}`, 'DEBUG');
+            }
+          }
+          
           logToExtension(`✅ Found step match: "${stepItem.label}"`, 'INFO');
           logToExtension(`  Step ID: ${stepItem.id}`, 'INFO');
           logToExtension(`  Total matches found: ${foundSteps.length}`, foundSteps.length > 1 ? 'WARN' : 'DEBUG');
@@ -805,25 +828,39 @@ class CucumberTestController {
           
           // This is likely a Background or Before hook step
           // Create a dynamic step item in the Before container
-          if (beforeStepsContainer) {
+          
+          // CRITICAL v26.2: For Feature-level execution, use the appropriate scenario's Before container
+          let targetBeforeContainer = beforeStepsContainer;
+          let targetBackgroundMap = backgroundStepsMap;
+          let targetBackgroundOrder = backgroundStepsOrder;
+          
+          // If we're in Feature-level execution and know the current scenario
+          if (currentScenarioId && scenarioBeforeContainers.has(currentScenarioId)) {
+            targetBeforeContainer = scenarioBeforeContainers.get(currentScenarioId)!;
+            targetBackgroundMap = scenarioBackgroundMaps.get(currentScenarioId)!;
+            targetBackgroundOrder = scenarioBackgroundOrders.get(currentScenarioId)!;
+            logToExtension(`  🎯 Using Before container for scenario: ${currentScenarioId}`, 'DEBUG');
+          }
+          
+          if (targetBeforeContainer) {
             logToExtension(`🔧 Detected Background/Before hook step: "${stepText}"`, 'INFO');
-            logToExtension(`  Execution order: #${backgroundStepsOrder.length + 1}`, 'DEBUG');
+            logToExtension(`  Execution order: #${targetBackgroundOrder.length + 1}`, 'DEBUG');
             
             // CRITICAL FIX v26.1: Start Before container on FIRST Background step detection
             // This ensures correct display order in Test Result panel
-            if (backgroundStepsOrder.length === 0) {
-              run.started(beforeStepsContainer);
+            if (targetBackgroundOrder.length === 0) {
+              run.started(targetBeforeContainer);
               logToExtension(`▶️  Started Before container NOW (first Background step detected)`, 'INFO');
             }
             
             // Check if we already created this background step
             const backgroundStepKey = `${stepText}_${stepResult.status}`;
-            let backgroundStep = backgroundStepsMap.get(stepText);
+            let backgroundStep = targetBackgroundMap.get(stepText);
             
             if (!backgroundStep) {
               // Create new background step item with execution order in ID
-              const executionOrder = backgroundStepsOrder.length;
-              const backgroundStepId = `${beforeStepsContainer.id}:bg_step:${executionOrder}`;
+              const executionOrder = targetBackgroundOrder.length;
+              const backgroundStepId = `${targetBeforeContainer.id}:bg_step:${executionOrder}`;
               backgroundStep = this.controller.createTestItem(
                 backgroundStepId,
                 stepText,
@@ -836,39 +873,19 @@ class CucumberTestController {
               backgroundStep.sortText = executionOrder.toString().padStart(3, '0');
               
               // Add to Before container
-              beforeStepsContainer.children.add(backgroundStep);
-              backgroundStepsMap.set(stepText, backgroundStep);
-              backgroundStepsOrder.push(backgroundStep); // Track execution order
+              targetBeforeContainer.children.add(backgroundStep);
+              targetBackgroundMap.set(stepText, backgroundStep);
+              targetBackgroundOrder.push(backgroundStep); // Track execution order
               
               // Mark as started immediately after Before container
               run.started(backgroundStep);
               
               logToExtension(`  ✨ Created new Background step: ${backgroundStepId}`, 'INFO');
-              logToExtension(`  📍 Added to Before container (position: ${executionOrder}, total: ${backgroundStepsMap.size})`, 'INFO');
-              logToExtension(`  📊 Execution order array size: ${backgroundStepsOrder.length}`, 'DEBUG');
-              logToExtension(`  🌳 Test Result tree structure:`, 'DEBUG');
-              logToExtension(`     └─ ${testItem.label}`, 'DEBUG');
-              logToExtension(`        ├─ ⚙️ Before (${backgroundStepsOrder.length} step${backgroundStepsOrder.length > 1 ? 's' : ''})`, 'DEBUG');
-              backgroundStepsOrder.forEach((bs, idx) => {
-                const marker = idx === backgroundStepsOrder.length - 1 ? '└─' : '├─';
-                logToExtension(`        │  ${marker} [${idx}] ${bs.label}`, 'DEBUG');
-              });
-              // Show scenario steps after Before container
-              const scenarioSteps: string[] = [];
-              testItem.children.forEach(child => {
-                if (child.id.includes(':step:')) {
-                  scenarioSteps.push(child.label);
-                }
-              });
-              if (scenarioSteps.length > 0) {
-                scenarioSteps.forEach((stepLabel, idx) => {
-                  const marker = idx === scenarioSteps.length - 1 ? '└─' : '├─';
-                  logToExtension(`        ${marker} ${stepLabel}`, 'DEBUG');
-                });
-              }
+              logToExtension(`  📍 Added to Before container (position: ${executionOrder}, total: ${targetBackgroundMap.size})`, 'INFO');
+              logToExtension(`  📊 Execution order array size: ${targetBackgroundOrder.length}`, 'DEBUG');
             } else {
               logToExtension(`  ⚠️  Background step already exists: ${backgroundStep.id}`, 'WARN');
-              logToExtension(`  Current execution order position: ${backgroundStepsOrder.findIndex(s => s.id === backgroundStep!.id)}`, 'DEBUG');
+              logToExtension(`  Current execution order position: ${targetBackgroundOrder.findIndex(s => s.id === backgroundStep!.id)}`, 'DEBUG');
             }
             
             // Use this background step as the stepItem to update
@@ -1003,8 +1020,81 @@ class CucumberTestController {
         }
         // If hasFailedStep is true, we already marked it as failed in onStepUpdate
       } else {
-        // This is a feature file
-        logToExtension(`Running entire feature file`, 'INFO');
+        // This is a feature file - need to initialize ALL scenarios and their steps
+        logToExtension(`Running entire feature file: ${testItem.label}`, 'INFO');
+        logToExtension(`╔═══════════════════════════════════════════════════════════════╗`, 'INFO');
+        logToExtension(`║ Initializing Feature Run - All Scenarios                     ║`, 'INFO');
+        logToExtension(`╚═══════════════════════════════════════════════════════════════╝`, 'INFO');
+        
+        // CRITICAL FIX v26.2: Initialize ALL scenarios and their steps when running feature
+        // Collect all scenario children
+        const scenarios: vscode.TestItem[] = [];
+        testItem.children.forEach(child => {
+          if (child.id.includes(':scenario:')) {
+            scenarios.push(child);
+          }
+        });
+        
+        logToExtension(`📋 Feature contains ${scenarios.length} scenarios`, 'INFO');
+        
+        // Initialize each scenario and its steps
+        for (let scenarioIdx = 0; scenarioIdx < scenarios.length; scenarioIdx++) {
+          const scenario = scenarios[scenarioIdx];
+          logToExtension(`\n📌 [${scenarioIdx + 1}/${scenarios.length}] Initializing scenario: ${scenario.label}`, 'INFO');
+          
+          // Mark scenario as started
+          run.started(scenario);
+          logToExtension(`  ▶️  Started scenario: ${scenario.id}`, 'INFO');
+          
+          // Create Before container for this scenario
+          const beforeId = `${scenario.id}:before`;
+          const scenarioBeforeContainer = this.controller.createTestItem(
+            beforeId,
+            '⚙️ Before (Background/Hooks)',
+            uri
+          );
+          scenario.children.add(scenarioBeforeContainer);
+          scenarioBeforeContainers.set(scenario.id, scenarioBeforeContainer);
+          scenarioBackgroundMaps.set(scenario.id, new Map());
+          scenarioBackgroundOrders.set(scenario.id, []);
+          logToExtension(`  📦 Created Before container: ${beforeId}`, 'INFO');
+          
+          // Collect and initialize all step children
+          const stepChildren: vscode.TestItem[] = [];
+          scenario.children.forEach(child => {
+            if (child.id.includes(':step:')) {
+              stepChildren.push(child);
+            }
+          });
+          
+          // Sort steps by line number
+          stepChildren.sort((a, b) => {
+            const lineA = parseInt(a.id.split(':step:')[1]) || 0;
+            const lineB = parseInt(b.id.split(':step:')[1]) || 0;
+            return lineA - lineB;
+          });
+          
+          logToExtension(`  📋 Initializing ${stepChildren.length} steps:`, 'INFO');
+          
+          // Add steps to map and mark as started
+          for (let i = 0; i < stepChildren.length; i++) {
+            const child = stepChildren[i];
+            const stepText = child.label;
+            const lineNum = child.id.split(':step:')[1];
+            const stepId = child.id;
+            
+            // Add to map using step ID as key
+            stepItemsMap.set(stepId, child);
+            
+            // Mark step as started
+            run.started(child);
+            
+            logToExtension(`    [${i + 1}/${stepChildren.length}] ▶️  Started: "${stepText}" (line ${lineNum})`, 'INFO');
+          }
+        }
+        
+        logToExtension(`\n✅ All ${scenarios.length} scenarios and ${stepItemsMap.size} steps initialized`, 'INFO');
+        logToExtension(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`, 'INFO');
         
         let exitCode: number;
         if (isDebug) {

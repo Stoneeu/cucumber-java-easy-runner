@@ -1,8 +1,8 @@
 {
   "name": "cucumber-java-easy-runner",
   "displayName": "Cucumber Java Easy Runner",
-  "description": "VS Code extension for easily running Cucumber Feature files in Java projects - v26.1: Fixed Background steps display order",
-  "version": "0.26.1",
+  "description": "VS Code extension for easily running Cucumber Feature files in Java projects - v26.2: Fixed Feature-level execution UI sync",
+  "version": "0.26.2",
   "publisher": "HakkiEtem",
   "author": {
     "name": "Hakki Etem"
