@@ -18,6 +18,7 @@ import { ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as net from 'net';
+import { findAllSourcePathsCached } from './maven-utils';
 
 /**
  * Extract Maven artifactId from pom.xml
@@ -171,24 +172,38 @@ export function createDebugConfiguration(
   const userConfig = vscode.workspace.getConfiguration('cucumberJavaEasyRunner.debug');
   const timeout = userConfig.get<number>('timeout', 30000);
 
-  // Use provided source paths or default patterns
+  // ⭐ v24: Auto-detect source paths for multi-module projects (same logic as createCucumberLaunchConfig)
   let sourcePaths: string[];
   if (projectSourcePaths && projectSourcePaths.length > 0) {
     sourcePaths = projectSourcePaths;
   } else {
-    // Default patterns for both single and multi-module projects
-    const configuredPaths = userConfig.get<string[]>('sourcePaths', []);
-    if (configuredPaths.length > 0) {
-      sourcePaths = configuredPaths;
-    } else {
-      // Auto-detect common Maven patterns
-      sourcePaths = [
-        'src/test/java',
-        'src/main/java',
-        '*/src/test/java',  // Multi-module pattern
-        '*/src/main/java'    // Multi-module pattern
-      ];
-    }
+    // Auto-detect with simple sync search
+    const workspaceRoot = workspaceFolder.uri.fsPath;
+    const detectedPaths: string[] = [];
+    
+    const searchSync = (dir: string, depth: number = 0) => {
+      if (depth > 2) {return;}
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (!entry.isDirectory()) {continue;}
+          if (['node_modules', 'target', 'build', '.git'].includes(entry.name)) {continue;}
+          
+          const fullPath = path.join(dir, entry.name);
+          const rel = path.relative(workspaceRoot, fullPath);
+          
+          if (rel.endsWith(path.join('src', 'test', 'java')) || 
+              rel.endsWith(path.join('src', 'main', 'java'))) {
+            detectedPaths.push(fullPath);
+          } else {
+            searchSync(fullPath, depth + 1);
+          }
+        }
+      } catch (e) {}
+    };
+    
+    searchSync(workspaceRoot);
+    sourcePaths = detectedPaths.length > 0 ? detectedPaths : ['src/test/java', 'src/main/java'];
   }
 
   // Convert relative paths to absolute paths for Java debugger
@@ -222,7 +237,7 @@ export function createDebugConfiguration(
   
   // Log debug configuration details
   if (logFunction) {
-    logFunction(`[createDebugConfiguration] Relative source paths: ${sourcePaths.join(', ')}`, 'DEBUG');
+    logFunction(`[createDebugConfiguration] Source paths detected: ${sourcePaths.length}`, 'INFO');
     logFunction(`[createDebugConfiguration] Absolute source paths: ${absoluteSourcePaths.join(', ')}`, 'DEBUG');
     if (absoluteClassPaths) {
       logFunction(`[createDebugConfiguration] Absolute class paths: ${absoluteClassPaths.join(', ')}`, 'DEBUG');
@@ -276,17 +291,38 @@ export function createLaunchDebugConfiguration(
   absoluteClassPaths?: string[],
   logFunction?: (message: string, level?: string) => void
 ): CucumberLaunchDebugConfig {
-  // Use provided source paths or default patterns
+  // ⭐ v24: Auto-detect source paths for multi-module projects (same logic)
   let sourcePaths: string[];
   if (projectSourcePaths && projectSourcePaths.length > 0) {
     sourcePaths = projectSourcePaths;
   } else {
-    sourcePaths = [
-      'src/test/java',
-      'src/main/java',
-      '*/src/test/java',
-      '*/src/main/java'
-    ];
+    // Auto-detect
+    const workspaceRoot = workspaceFolder.uri.fsPath;
+    const detectedPaths: string[] = [];
+    
+    const searchSync = (dir: string, depth: number = 0) => {
+      if (depth > 2) {return;}
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (!entry.isDirectory()) {continue;}
+          if (['node_modules', 'target', 'build', '.git'].includes(entry.name)) {continue;}
+          
+          const fullPath = path.join(dir, entry.name);
+          const rel = path.relative(workspaceRoot, fullPath);
+          
+          if (rel.endsWith(path.join('src', 'test', 'java')) || 
+              rel.endsWith(path.join('src', 'main', 'java'))) {
+            detectedPaths.push(fullPath);
+          } else {
+            searchSync(fullPath, depth + 1);
+          }
+        }
+      } catch (e) {}
+    };
+    
+    searchSync(workspaceRoot);
+    sourcePaths = detectedPaths.length > 0 ? detectedPaths : ['src/test/java', 'src/main/java'];
   }
 
   // Convert to absolute paths
@@ -328,7 +364,7 @@ export function createLaunchDebugConfiguration(
     logFunction(`[createLaunchDebugConfiguration] Main class: ${mainClass}`, 'DEBUG');
     logFunction(`[createLaunchDebugConfiguration] Args: ${args.join(' ')}`, 'DEBUG');
     logFunction(`[createLaunchDebugConfiguration] Project name: ${effectiveProjectName}`, 'DEBUG');
-    logFunction(`[createLaunchDebugConfiguration] Source paths: ${absoluteSourcePaths.join(', ')}`, 'DEBUG');
+    logFunction(`[createLaunchDebugConfiguration] Source paths detected: ${sourcePaths.length}`, 'INFO');
     if (absoluteClassPaths && absoluteClassPaths.length > 0) {
       logFunction(`[createLaunchDebugConfiguration] ⭐ v23: Using ${absoluteClassPaths.length} resolved classpaths`, 'INFO');
       logFunction(`[createLaunchDebugConfiguration] First 3 classpaths: ${absoluteClassPaths.slice(0, 3).join(', ')}`, 'DEBUG');
@@ -378,17 +414,75 @@ export function createCucumberLaunchConfig(
   projectSourcePaths?: string[],
   logFunction?: (message: string, level?: string) => void
 ): CucumberLaunchDebugConfig {
-  // Use provided source paths or default patterns
+  // ⭐ v24: Auto-detect source paths for multi-module projects
   let sourcePaths: string[];
   if (projectSourcePaths && projectSourcePaths.length > 0) {
     sourcePaths = projectSourcePaths;
+    if (logFunction) {
+      logFunction(`[createCucumberLaunchConfig] Using provided source paths (${sourcePaths.length})`, 'DEBUG');
+    }
   } else {
-    sourcePaths = [
-      'src/test/java',
-      'src/main/java',
-      '*/src/test/java',
-      '*/src/main/java'
-    ];
+    // Use synchronous filesystem search as fallback
+    // Note: For better performance, caller should pre-compute and pass projectSourcePaths
+    const workspaceRoot = workspaceFolder.uri.fsPath;
+    
+    try {
+      // Try to find all source paths in the workspace
+      // This is a blocking operation - prefer passing projectSourcePaths for async workflows
+      const detectedPaths: string[] = [];
+      
+      // Simple synchronous search limited to 2 levels deep
+      const searchSync = (dir: string, depth: number = 0) => {
+        if (depth > 2) {return;}
+        try {
+          const entries = fs.readdirSync(dir, { withFileTypes: true });
+          for (const entry of entries) {
+            if (!entry.isDirectory()) {continue;}
+            if (['node_modules', 'target', 'build', '.git'].includes(entry.name)) {continue;}
+            
+            const fullPath = path.join(dir, entry.name);
+            const rel = path.relative(workspaceRoot, fullPath);
+            
+            if (rel.endsWith(path.join('src', 'test', 'java')) || 
+                rel.endsWith(path.join('src', 'main', 'java'))) {
+              detectedPaths.push(fullPath);
+            } else {
+              searchSync(fullPath, depth + 1);
+            }
+          }
+        } catch (e) {
+          // Ignore errors
+        }
+      };
+      
+      searchSync(workspaceRoot);
+      
+      if (detectedPaths.length > 0) {
+        sourcePaths = detectedPaths;
+        if (logFunction) {
+          logFunction(`[createCucumberLaunchConfig] ⭐ v24: Auto-detected ${sourcePaths.length} source paths`, 'INFO');
+          sourcePaths.forEach((sp, idx) => {
+            const rel = path.relative(workspaceRoot, sp);
+            logFunction(`  [${idx + 1}] ${rel}`, 'DEBUG');
+          });
+        }
+      } else {
+        // Fallback to default patterns
+        sourcePaths = [
+          'src/test/java',
+          'src/main/java'
+        ];
+        if (logFunction) {
+          logFunction(`[createCucumberLaunchConfig] No source paths detected, using defaults`, 'DEBUG');
+        }
+      }
+    } catch (error: any) {
+      // Fallback on any error
+      sourcePaths = ['src/test/java', 'src/main/java'];
+      if (logFunction) {
+        logFunction(`[createCucumberLaunchConfig] Error detecting paths: ${error.message}, using defaults`, 'WARN');
+      }
+    }
   }
 
   // Convert to absolute paths
@@ -405,6 +499,7 @@ export function createCucumberLaunchConfig(
     logFunction(`[createCucumberLaunchConfig] ⭐ v23: Launch Mode with Cucumber CLI`, 'INFO');
     logFunction(`[createCucumberLaunchConfig] Mode: ${isDebug ? 'DEBUG' : 'RUN'}`, 'INFO');
     logFunction(`[createCucumberLaunchConfig] Classpath entries: ${classPaths.length}`, 'INFO');
+    logFunction(`[createCucumberLaunchConfig] Source paths: ${absoluteSourcePaths.length}`, 'INFO');
     logFunction(`[createCucumberLaunchConfig] Cucumber args: ${cucumberArgs.join(' ')}`, 'DEBUG');
     logFunction(`[createCucumberLaunchConfig] First 3 classpaths:`, 'DEBUG');
     classPaths.slice(0, 3).forEach((cp, idx) => {
@@ -814,4 +909,76 @@ export async function startLaunchDebugSession(
 
   return activeSession;
 }
+
+/**
+ * ⭐ v25: Maven Surefire Debug Mode
+ * 
+ * Create attach debug configuration for Maven Surefire debug mode.
+ * Maven Surefire will start JVM in debug mode and wait for debugger to attach.
+ * 
+ * Default Surefire debug configuration:
+ * - Port: 5005
+ * - Suspend: yes (JVM waits for debugger)
+ * - Address: localhost:5005
+ * 
+ * @param workspaceFolder - VS Code workspace folder
+ * @param projectName - Maven artifactId for debugging
+ * @param workspaceRoot - Workspace root path for source path resolution
+ * @param logFunction - Optional logging callback
+ * @returns Debug configuration for attaching to Maven Surefire
+ */
+export async function createMavenSurefireAttachConfig(
+  workspaceFolder: vscode.WorkspaceFolder,
+  projectName: string,
+  workspaceRoot: string,
+  logFunction?: (message: string, level?: string) => void
+): Promise<CucumberDebugConfig> {
+  const log = (msg: string, level: string = 'INFO') => {
+    if (logFunction) {
+      logFunction(msg, level);
+    }
+  };
+
+  log('[createMavenSurefireAttachConfig] ⭐ v25: Creating Maven Surefire attach configuration', 'INFO');
+
+  // Auto-detect all source paths in the project
+  log('[createMavenSurefireAttachConfig] Auto-detecting source paths...', 'DEBUG');
+  const absoluteSourcePaths = await findAllSourcePathsCached(workspaceRoot, logFunction);
+  
+  log(`[createMavenSurefireAttachConfig] Found ${absoluteSourcePaths.length} source paths`, 'INFO');
+
+  // Convert to ${workspaceFolder} relative paths for VS Code debugger
+  const sourcePaths = absoluteSourcePaths.map(absolutePath => {
+    const relativePath = path.relative(workspaceRoot, absolutePath);
+    const normalizedPath = relativePath.split(path.sep).join('/');
+    return `\${workspaceFolder}/${normalizedPath}`;
+  });
+
+  log('[createMavenSurefireAttachConfig] Source paths (first 5):', 'DEBUG');
+  sourcePaths.slice(0, 5).forEach((sp, idx) => {
+    log(`  [${idx + 1}] ${sp}`, 'DEBUG');
+  });
+
+  // Default Maven Surefire debug port
+  const debugPort = 5005;
+
+  const config: CucumberDebugConfig = {
+    type: 'java',
+    name: `Attach to Maven Surefire (${projectName})`,
+    request: 'attach',
+    hostName: 'localhost',
+    port: debugPort,
+    timeout: 30000, // 30 seconds timeout
+    projectName: projectName,
+    sourcePaths: sourcePaths
+  };
+
+  log('[createMavenSurefireAttachConfig] ✓ Configuration created', 'INFO');
+  log(`  - Port: ${debugPort}`, 'DEBUG');
+  log(`  - Project: ${projectName}`, 'DEBUG');
+  log(`  - Source paths: ${sourcePaths.length} entries`, 'DEBUG');
+
+  return config;
+}
+
 

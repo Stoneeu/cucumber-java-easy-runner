@@ -1,8 +1,8 @@
 {
   "name": "cucumber-java-easy-runner",
   "displayName": "Cucumber Java Easy Runner",
-  "description": "VS Code extension for easily running Cucumber Feature files in Java projects - v23.37: Auto-compile configurable (default: off)",
-  "version": "0.23.37",
+  "description": "VS Code extension for easily running Cucumber Feature files in Java projects - v26.1: Fixed Background steps display order",
+  "version": "0.26.1",
   "publisher": "HakkiEtem",
   "author": {
     "name": "Hakki Etem"
@@ -134,8 +134,8 @@
             "java",
             "maven"
           ],
-          "default": "java",
-          "description": "Execution mode: 'java' for direct Java execution, 'maven' for Maven test execution (supports multi-module projects)"
+          "default": "maven",
+          "description": "Execution mode: 'java' for direct Java execution, 'maven' for Maven test execution (supports multi-module projects, recommended)"
         },
         "cucumberJavaEasyRunner.testClassName": {
           "type": "string",

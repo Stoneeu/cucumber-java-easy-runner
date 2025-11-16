@@ -256,6 +256,8 @@ export function buildCucumberArgs(
   const featureArg = lineNumber ? `${featurePath}:${lineNumber}` : featurePath;
   args.push(featureArg);
 
+  
+
   return args;
 }
 
@@ -268,4 +270,279 @@ export function buildCucumberArgs(
 export function isValidMavenProject(projectRoot: string): boolean {
   const pomPath = path.join(projectRoot, 'pom.xml');
   return fs.existsSync(pomPath);
+}
+
+/**
+ * Find all source paths in a Maven project (supports multi-module projects)
+ * 
+ * Searches for all `src/test/java` and `src/main/java` directories recursively.
+ * Useful for configuring debugger sourcePaths in multi-module projects.
+ * 
+ * @param projectRoot - Absolute path to project root (workspace root)
+ * @param logFunction - Optional logging callback
+ * @returns Array of absolute source paths
+ * 
+ * @example
+ * const sourcePaths = await findAllSourcePaths('/workspace');
+ * // Returns: [
+ * //   '/workspace/src/test/java',
+ * //   '/workspace/src/main/java',
+ * //   '/workspace/module-a/src/test/java',
+ * //   '/workspace/module-a/src/main/java',
+ * //   '/workspace/module-b/src/test/java',
+ * //   '/workspace/module-b/src/main/java'
+ * // ]
+ */
+export async function findAllSourcePaths(
+  projectRoot: string,
+  logFunction?: (message: string, level?: string) => void
+): Promise<string[]> {
+  const log = (msg: string, level: string = 'INFO') => {
+    if (logFunction) {
+      logFunction(msg, level);
+    }
+  };
+
+  log(`[findAllSourcePaths] Searching for source paths in: ${projectRoot}`, 'DEBUG');
+
+  const sourcePaths: string[] = [];
+  const excludeDirs = new Set(['node_modules', 'target', 'build', '.git', '.svn', 'dist', 'out']);
+
+  /**
+   * Recursively search for src/test/java and src/main/java directories
+   */
+  function searchDirectory(dir: string, depth: number = 0): void {
+    // Limit recursion depth to avoid performance issues
+    if (depth > 10) {
+      return;
+    }
+
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+
+      for (const entry of entries) {
+        if (!entry.isDirectory()) {
+          continue;
+        }
+
+        const fullPath = path.join(dir, entry.name);
+        
+        // Skip excluded directories
+        if (excludeDirs.has(entry.name)) {
+          continue;
+        }
+
+        // Check if this is a source directory
+        const relativePath = path.relative(projectRoot, fullPath);
+        
+        // Match src/test/java or src/main/java patterns
+        if (relativePath.endsWith(path.join('src', 'test', 'java')) ||
+            relativePath.endsWith(path.join('src', 'main', 'java'))) {
+          sourcePaths.push(fullPath);
+          log(`[findAllSourcePaths] Found: ${relativePath}`, 'DEBUG');
+          // Don't recurse into source directories
+          continue;
+        }
+
+        // Recurse into subdirectories
+        searchDirectory(fullPath, depth + 1);
+      }
+    } catch (error: any) {
+      // Ignore permission errors and continue
+      log(`[findAllSourcePaths] Warning: Cannot read directory ${dir}: ${error.message}`, 'DEBUG');
+    }
+  }
+
+  // Start search from project root
+  searchDirectory(projectRoot);
+
+  // Sort paths by depth (deeper paths first - for multi-module priority)
+  sourcePaths.sort((a, b) => {
+    const depthA = a.split(path.sep).length;
+    const depthB = b.split(path.sep).length;
+    return depthB - depthA; // Descending order
+  });
+
+  log(`[findAllSourcePaths] Found ${sourcePaths.length} source paths`, 'INFO');
+
+  return sourcePaths;
+}
+
+// Cache for source paths to avoid repeated filesystem scans
+const sourcePathsCache = new Map<string, { paths: string[]; timestamp: number }>();
+const CACHE_TTL = 60000; // 1 minute
+
+/**
+ * Find all source paths with caching support
+ * 
+ * Same as findAllSourcePaths but caches results for 1 minute
+ * to avoid repeated filesystem scans during the same session.
+ * 
+ * @param projectRoot - Absolute path to project root
+ * @param logFunction - Optional logging callback
+ * @returns Array of absolute source paths
+ */
+export async function findAllSourcePathsCached(
+  projectRoot: string,
+  logFunction?: (message: string, level?: string) => void
+): Promise<string[]> {
+  const log = (msg: string, level: string = 'INFO') => {
+    if (logFunction) {
+      logFunction(msg, level);
+    }
+  };
+
+  const now = Date.now();
+  const cached = sourcePathsCache.get(projectRoot);
+
+  // Check cache validity
+  if (cached && (now - cached.timestamp) < CACHE_TTL) {
+    log(`[findAllSourcePathsCached] Using cached source paths (${cached.paths.length} entries)`, 'DEBUG');
+    return cached.paths;
+  }
+
+  // Cache miss or expired - do fresh search
+  log(`[findAllSourcePathsCached] Cache miss - performing fresh search`, 'DEBUG');
+  const paths = await findAllSourcePaths(projectRoot, logFunction);
+
+  // Update cache
+  sourcePathsCache.set(projectRoot, { paths, timestamp: now });
+
+  return paths;
+}
+
+/**
+ * Convert absolute source paths to VS Code ${workspaceFolder} relative paths
+ * 
+ * @param absolutePaths - Array of absolute source paths
+ * @param workspaceRoot - Workspace root directory
+ * @returns Array of ${workspaceFolder} relative paths
+ * 
+ * @example
+ * convertToWorkspaceFolderPaths(
+ *   ['/home/user/project/spring/datahunter-system/src/test/java'],
+ *   '/home/user/project'
+ * )
+ * // Returns: ['${workspaceFolder}/spring/datahunter-system/src/test/java']
+ */
+export function convertToWorkspaceFolderPaths(
+  absolutePaths: string[],
+  workspaceRoot: string
+): string[] {
+  return absolutePaths.map(absolutePath => {
+    const relativePath = path.relative(workspaceRoot, absolutePath);
+    // Convert to forward slashes for consistency
+    const normalizedPath = relativePath.split(path.sep).join('/');
+    return `\${workspaceFolder}/${normalizedPath}`;
+  });
+}
+
+/**
+ * Build Maven debug command for Cucumber test execution
+ * 
+ * Generates Maven command with:
+ * - Surefire debug mode (-Dmaven.surefire.debug)
+ * - Module selection (-pl)
+ * - Test class selection (-Dtest=)
+ * - Cucumber feature file selection (-Dcucumber.features=)
+ * 
+ * @param moduleRelativePath - Relative path to module (e.g., 'spring/datahunter-system')
+ * @param testClassName - Simple test class name (e.g., 'MktSegmentCriteriaUpdateTest')
+ * @param featureRelativePath - Feature file path relative to module's resources
+ * @param lineNumber - Optional scenario line number
+ * @returns Maven command arguments array
+ * 
+ * @example
+ * buildMavenDebugCommand(
+ *   'spring/datahunter-system',
+ *   'MktSegmentCriteriaUpdateTest',
+ *   'feature/MKT05A06R01-mktSegment_CriteriaUpdate.feature',
+ *   17
+ * )
+ * // Returns: [
+ * //   'test',
+ * //   '-Dcucumber.features=classpath:feature/MKT05A06R01-mktSegment_CriteriaUpdate.feature:17',
+ * //   '-pl', 'spring/datahunter-system',
+ * //   '-Dtest=MktSegmentCriteriaUpdateTest',
+ * //   '-Dmaven.surefire.debug'
+ * // ]
+ */
+export function buildMavenDebugCommand(
+  moduleRelativePath: string,
+  testClassName: string,
+  featureRelativePath: string,
+  lineNumber?: number
+): string[] {
+  const args: string[] = ['test'];
+
+  // Build cucumber.features parameter
+  const featureArg = lineNumber 
+    ? `classpath:${featureRelativePath}:${lineNumber}`
+    : `classpath:${featureRelativePath}`;
+  args.push(`-Dcucumber.features=${featureArg}`);
+
+  // Add module selection (if not root module)
+  if (moduleRelativePath !== '.') {
+    args.push('-pl', moduleRelativePath);
+  }
+
+  args.push('-Dcucumber.plugin=pretty');
+
+  // Add test class selection
+  args.push(`-Dtest=${testClassName}`);
+
+  // Enable Surefire debug mode (will listen on port 5005 by default)
+  args.push('-Dmaven.surefire.debug');
+
+  // fix execuete twice
+  args.push('-Dsurefire.includeJUnit5Engines=cucumber');
+
+  return args;
+}
+
+/**
+ * Extract feature file path relative to module's test resources
+ * 
+ * Converts absolute path to classpath-relative path for Maven
+ * 
+ * @param absoluteFeaturePath - Absolute path to feature file
+ * @param moduleRoot - Absolute path to module root
+ * @returns Relative path from test/resources (e.g., 'feature/test.feature')
+ * 
+ * @example
+ * extractFeatureRelativePath(
+ *   '/project/spring/datahunter-system/src/test/resources/feature/test.feature',
+ *   '/project/spring/datahunter-system'
+ * )
+ * // Returns: 'feature/test.feature'
+ */
+export function extractFeatureRelativePath(
+  absoluteFeaturePath: string,
+  moduleRoot: string
+): string {
+  const resourcesPath = path.join(moduleRoot, 'src', 'test', 'resources');
+  
+  if (absoluteFeaturePath.startsWith(resourcesPath)) {
+    const relativePath = path.relative(resourcesPath, absoluteFeaturePath);
+    // Convert to forward slashes for classpath
+    return relativePath.split(path.sep).join('/');
+  }
+
+  // Fallback: use filename only
+  return path.basename(absoluteFeaturePath);
+}
+
+/**
+ * Extract simple test class name from full path
+ * 
+ * @param testClassPath - Absolute path to test class file
+ * @returns Simple class name without .java extension
+ * 
+ * @example
+ * extractTestClassName('/path/to/MktSegmentCriteriaUpdateTest.java')
+ * // Returns: 'MktSegmentCriteriaUpdateTest'
+ */
+export function extractTestClassName(testClassPath: string): string {
+  const fileName = path.basename(testClassPath);
+  return fileName.replace(/\.java$/, '');
 }
